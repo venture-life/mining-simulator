@@ -1,6 +1,6 @@
 # Mining Simulator (Event-Queue V2 with Optional Attacker)
 
-A lightweight Python project to simulate Bitcoin mining dynamics using a continuous-time event-queue model (global Poisson arrivals with thinning and de-duplication). Supports honest-only runs or scenarios with a selfish attacker, and includes optional plotting.
+Project to simulate mining dynamics using a continuous-time event-queue model (global Poisson arrivals with thinning by share). Supports honest-only runs or scenarios with a selfish attacker, and includes optional plotting.
 
 ## Features
 - Event-queue V2 simulator (subcommand: `mining-eventq-v2`):
@@ -21,14 +21,16 @@ A lightweight Python project to simulate Bitcoin mining dynamics using a continu
 2. Run Event-Queue V2 (honest-only) with a custom longest-chain dominance `k` and save a local-chains plot:
    ```bash
    python run_simulation.py mining-eventq-v2 \
-     --groups 3 --steps 100000 --rate 0.0166667 --window 5.0 --k 3 \
+     --groups 3 --steps 1000 --rate 0.0166667 --window 5.0 --k 3 \
      --local-chains --save-local-chains out/local_chains_demo.svg
    ```
-3. Add a selfish attacker with share α=0.30 and include `k` in the plot title automatically:
+3. Add a selfish attacker with share α=0.40. The last lane in the plot will be the attacker:
+   Note, the attacker currently is very cpu-intensive only steps <=2000 are recommended. (and not very effective yet. proper policy still needs to be implemented)
    ```bash
    python run_simulation.py mining-eventq-v2 \
-     --groups 3 --steps 80000 --k 4 --attacker-share 0.30 \
-     --local-chains --save-local-chains out/local_chains_attacker_k4.svg
+     --groups 2 --steps 1000 --k 3 --attacker-share 0.40 \
+     --rate 0.0166667 --window 5.0 \
+     --local-chains --save-local-chains out/local_chains_attacker.svg
    ```
 4. CLI help for all options:
    ```bash
@@ -56,5 +58,4 @@ README.md
 ```
 
 ## References
-- Eyal, I., & Sirer, E. G. (2014). Majority is not Enough: Bitcoin Mining is Vulnerable. Financial Cryptography and Data Security.
 - Heilman, E., Narula, N., Tanzer, G., & Virza, M. (2020). Publish or Perish: A Backward-Compatible Defense Against Selfish Mining in Bitcoin.
