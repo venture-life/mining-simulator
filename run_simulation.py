@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from honest_mining import simulate_mining_eventqV2
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Event-Queue V2 Mining Simulator")
+    sub = p.add_subparsers(dest="cmd")
+
+    # Event-queue V2 (global Poisson look-ahead + thinning, optional attacker)
+    p_mine_v2 = sub.add_parser("mining-eventq-v2", help="Run event-queue V2 (global Poisson look-ahead + thinning); optionally include an attacker miner")
+    p_mine_v2.add_argument("--groups", type=int, default=3, help="Number of honest groups (pools)")
+    p_mine_v2.add_argument("--shares", type=str, default=None, help="Comma-separated shares summing to 1 (default: equal)")
+    p_mine_v2.add_argument("--steps", type=int, default=1000, help="Number of heights to simulate")
+    p_mine_v2.add_argument("--rate", type=float, default=1.0/120.0, help="Global block rate Λ (blocks/sec)")
+    p_mine_v2.add_argument("--window", type=float, default=5.0, help="Δ window seconds for in-window rivals")
+    p_mine_v2.add_argument("--k", type=int, default=3, help="Fork-resolution dominance k for the longest-chain rule")
+    p_mine_v2.add_argument("--seed", type=int, default=None, help="RNG seed")
+    p_mine_v2.add_argument("--track-times", action="store_true", help="Also simulate and report first rival timing stats")
+    p_mine_v2.add_argument("--time-bins", type=int, default=50, help="Histogram bins for timing when --track-times is set")
+    p_mine_v2.add_argument("--attacker-share", type=float, default=None, help="Attacker (selfish miner) share α in (0,1); if set, adds one attacker miner. Honest shares are rescaled to sum to (1-α): use provided --shares as relative weights, else uniform (1-α)/groups.")
+    # Local chains (per-miner knowledge) visualization
+    p_mine_v2.add_argument("--local-chains", action="store_true", help="Plot per-miner local chains with branching on each lane")
+    p_mine_v2.add_argument("--save-local-chains", type=str, default=None, help="Path to save local chains plot (PNG/SVG)")
+    p_mine_v2.add_argument("--max-edges", type=int, default=None, help="Limit number of delivery arrows to draw")
+    p_mine_v2.add_argument("--annotate-ihw", action="store_true", help="Annotate id, height, weight on three lines inside nodes (i\\nh\\nw)")
+    # Layout controls
+    p_mine_v2.add_argument("--time-layout", action="store_true", help="Use real time on x-axis (may overlap boxes); default is discrete slots per timestamp")
+    p_mine_v2.add_argument("--slot-width", type=float, default=1.0, help="Slot width in data units when using discrete layout")
+    p_mine_v2.add_argument("--trace-limit", type=int, default=None, help="Limit number of events recorded in trace")
+
+    # Require a subcommand
+    args = p.parse_args()
+    if args.cmd is None:
+        p.print_help()
+        return
+
+    if args.cmd == "mining-eventq-v2":
+        # Parse shares if provided
+        if args.shares is not None:
+            try:
+                shares = [float(x) for x in args.shares.split(",") if x.strip() != ""]
+            except ValueError:
+                raise SystemExit("--shares must be a comma-separated list of floats, e.g., '0.33,0.33,0.34'")
+        else:
+            shares = None
+
+        want_trace = bool(args.local_chains or args.save_local_chains)
+        res = simulate_mining_eventqV2(
+            steps=args.steps,
+            groups=args.groups,
+            shares=shares,
+            Lambda=args.rate,
+            D=args.window,
+            k=args.k,
+            seed=args.seed,
+            track_times=args.track_times,
+            time_bins=args.time_bins,
+            trace=want_trace,
+            trace_limit=args.trace_limit,
+            attacker_share=args.attacker_share,
+        )
+        d = res.to_dict()
+        keys = (
+            "groups",
+            "shares",
+            "Lambda",
+            "D",
+            "steps",
+            "fork_fraction",
+            "total_uncles",
+            "canonical_counts",
+            "uncle_counts",
+            # revenue (parents-only, same as canonical_counts)
+            "revenue_counts",
+            "revenue_fraction",
+            "attacker_index",
+            "attacker_revenue",
+            "attacker_revenue_fraction",
+            "S_size_hist_1_to_G",
+            "max_prop_delay",
+            # Sanity-check metrics from V2
+            "elapsed_time",
+            "mine_events",
+            "canonical_rate",
+            "mine_rate",
+        )
+        out = {k: d[k] for k in keys if k in d}
+        if getattr(args, "track_times", False) and d.get("timing") is not None:
+            out["timing"] = d["timing"]
+        header = "Event-queue V2 run (attacker α={:.3f})".format(args.attacker_share) if args.attacker_share is not None else "Event-queue V2 run:"
+        print(header)
+        print(out)
+
+        # Optional visualizations using the event trace
+        if want_trace:
+            from visualization.plotter import plot_local_chains_eventq_v2
+            total_G = int(d.get("groups", args.groups))
+            if args.attacker_share is not None:
+                title = f"V2 (G={total_G}, Λ={args.rate:.5f} 1/s, D={args.window}s, k={args.k}, α={args.attacker_share:.3f})"
+            else:
+                title = f"V2 (G={total_G}, Λ={args.rate:.5f} 1/s, D={args.window}s, k={args.k})"
+            # Internal visualization defaults (CLI flags removed)
+            box_pad = 0.06
+            inch_per_step = 1.5 if args.time_layout else 0.3
+            # Per-miner local chains (knowledge-centric)
+            if args.local_chains or args.save_local_chains:
+                plot_local_chains_eventq_v2(
+                    res, title=f"Local chains – {title}",
+                    save_path=args.save_local_chains,
+                    show=bool(args.local_chains),
+                    annotate_ihw=bool(args.annotate_ihw),
+                    max_edges=args.max_edges,
+                    discrete_layout=(not args.time_layout),
+                    slot_width=float(args.slot_width),
+                    box_pad=box_pad,
+                    inch_per_step=inch_per_step,
+                )
+
+
+if __name__ == "__main__":
+    main()
