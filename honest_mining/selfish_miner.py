@@ -298,6 +298,10 @@ class SelfishMiner:
             # Prefer match when feasible, especially when lucky or override is costly
             if match_ok and (not over_ok or n_match < n_over or self.luck or n_over > allow_over):
                 return 'match'
+            # If we have a private lead >= 2 and k is small (<=2), reveal one to maintain a one-block lead
+            # only when override isn't feasible; for larger k, keep withholding to try to reach k-dominance
+            if lead >= 2 and not over_ok and k <= 2:
+                return 'reveal'
             # High-alpha fallback: still take override if feasible (even if costly)
             if over_ok and a >= 1.0/3.0:
                 return 'override'
@@ -353,7 +357,16 @@ class SelfishMiner:
 
     # ========================= PoP action space =============================
     def act(self, action: str, now: float) -> List[Block]:
-        """Execute a PoP action and return blocks to broadcast."""
+        """Execute a PoP action and return blocks to broadcast.
+
+        Supported actions:
+        - 'adopt': discard private fork and follow public chain
+        - 'override': publish minimal blocks to dominate (by k-length or weight)
+        - 'match': publish minimal blocks to match weights (create a fair tie under weight FRP)
+        - 'even': publish minimal blocks to reach >= height but lower weight
+        - 'reveal'/'reveal_one': publish exactly one withheld block (used to maintain a one-block lead when lead >= 2)
+        - 'hide': keep withholding (no publish)
+        """
         # Mark that we've acted for the current local event (at-most-once per event)
         self._last_acted_event_id = self._local_event_id
         a = (action or '').strip().lower()
@@ -378,6 +391,11 @@ class SelfishMiner:
             # Use cached planning results (for runtime performance optimization)
             n = self._get_plan(now).get('n_even')
             res = self._publish_n(now, n) if (n is not None and n > 0) else []
+            self._last_receive_from_competitor = False
+            return res
+        elif a == 'reveal' or a == 'reveal_one':
+            # Publish exactly one withheld block (classic SM: keep a one-block lead when lead >= 2)
+            res = self._publish_n(now, 1)
             self._last_receive_from_competitor = False
             return res
         elif a == 'hide':
@@ -503,9 +521,11 @@ class SelfishMiner:
                     # Preserve original semantics for cases where fast path doesn't apply (incl. k==0)
                     if ((self.k > 0 and hdiff >= self.k) or (wdiff > 0)) and (selected.id == our.id):
                         n_override = n_cur
-            # match condition: equal weights (best selfish vs best honest)
+            # match condition: equal weights (best selfish vs best honest) AND FRP would select our head
             if n_match is None and wdiff == 0:
-                n_match = n_cur
+                selected2 = m._select_head()
+                if selected2.id == our.id:
+                    n_match = n_cur
             # even condition: height >= and weight <
             if n_even is None and (hdiff >= 0 and wdiff < 0):
                 n_even = n_cur

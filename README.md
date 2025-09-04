@@ -47,9 +47,8 @@ To model an attacker that joins on top of a fixed honest baseline before the dif
 - Example (α = 0.30):
   ```bash
   python run_simulation.py mining-eventq-v2 \
-    --groups 3 --steps 80000 --rate 0.0166667 --window 5.0 \
-    --attacker-share 0.30 --total-hashrate-mode additive_attacker \
-    --local-chains --save-local-chains out/local_chains_attacker_additive.svg
+    --groups 3 --steps 2000 --rate 0.0166667 --window 5.0 \
+    --attacker-share 0.30 --total-hashrate-mode additive_attacker
   ```
 
 ## Example runs
