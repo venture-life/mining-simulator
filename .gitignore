@@ -32,4 +32,7 @@ Thumbs.db
 *.log
 
 tmp/
+.pytest_cache/
+.windsurf/
+*/__pycache__/
 
