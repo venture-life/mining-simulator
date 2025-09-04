@@ -11,6 +11,7 @@ Project to simulate mining dynamics using a continuous-time event-queue model (g
   - Total hashrate mode via `--total-hashrate-mode {fixed_total,additive_attacker}`
 - Local-chains plotting of each miner's knowledge over time (sub-tracks per timestamp; lanes auto-scale by concurrency)
 - Deterministic tie-breaking consistent across miners
+- Optional timing diagnostics via `--track-times` (compact PASS/FAIL summary by default); add `--timing-verbose` for full details
 
 ## Quickstart
 1. Create/activate a virtual environment (recommended) and install dependencies:
@@ -50,6 +51,52 @@ To model an attacker that joins on top of a fixed honest baseline before the dif
     --groups 3 --steps 2000 --rate 0.0166667 --window 5.0 \
     --attacker-share 0.30 --total-hashrate-mode additive_attacker
   ```
+
+## Timing diagnostics
+
+You can collect and print timing and streak sanity checks using the following flags:
+
+- `--track-times`: enable timing collection and print a compact summary.
+  - Adds a `timing` block with:
+    - `enabled`
+    - `first_rival_fraction` (fraction of heights with an in-window rival)
+    - `mean_first_rival_time` (mean time until the first rival, in seconds)
+    - `streaks.sanity` (compact PASS/FAIL verdict with component tests and alpha thresholds)
+- `--timing-verbose`: print the full diagnostics instead of the compact summary. This includes per-bin Poisson p-values, aggregated tail p-value, and per-miner chi-square statistics.
+- `--time-bins N`: number of histogram bins used for timing diagnostics (default: 50).
+
+Example (compact summary by default):
+```bash
+python run_simulation.py mining-eventq-v2 \
+  --groups 5 --steps 100000 --rate 0.00833333333 --window 5.0 \
+  --track-times
+```
+
+Example (full verbose diagnostics):
+```bash
+python run_simulation.py mining-eventq-v2 \
+  --groups 5 --steps 100000 --rate 0.00833333333 --window 5.0 \
+  --track-times --timing-verbose
+```
+
+In compact mode, the printed `timing` block looks like this (values illustrative):
+```text
+"timing": {
+  "enabled": true,
+  "first_rival_fraction": 0.007,
+  "mean_first_rival_time": 1.20,
+  "streaks": {
+    "sanity": {
+      "alpha": {"global": 0.01, "bin": 0.01, "tail": 0.01, "binom": 0.01},
+      "global_pass": true,
+      "tail_pass": true,
+      "per_miner_pass": true,
+      "binom_pass": true,
+      "verdict": "PASS"
+    }
+  }
+}
+```
 
 ## Example runs
 honest-run:

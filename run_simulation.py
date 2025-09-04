@@ -19,6 +19,7 @@ def main() -> None:
     p_mine_v2.add_argument("--seed", type=int, default=None, help="RNG seed")
     p_mine_v2.add_argument("--track-times", action="store_true", help="Also simulate and report first rival timing stats")
     p_mine_v2.add_argument("--time-bins", type=int, default=50, help="Histogram bins for timing when --track-times is set")
+    p_mine_v2.add_argument("--timing-verbose", action="store_true", help="Print full timing/streaks diagnostics; default prints compact sanity summary only")
     p_mine_v2.add_argument("--attacker-share", type=float, default=None, help="Attacker (selfish miner) share α in (0,1); if set, adds one attacker miner. Honest shares are rescaled to sum to (1-α): use provided --shares as relative weights, else uniform (1-α)/groups.")
     # Total hashrate interpretation and concurrency control
     p_mine_v2.add_argument(
@@ -121,7 +122,19 @@ def main() -> None:
         out["hashrate_factor"] = f
         out["mu"] = float(out.get("Lambda", Lambda_eff)) * float(out.get("D", D_eff))
         if getattr(args, "track_times", False) and d.get("timing") is not None:
-            out["timing"] = d["timing"]
+            if getattr(args, "timing_verbose", False):
+                out["timing"] = d["timing"]
+            else:
+                t = dict(d["timing"])  # shallow copy
+                summary = {
+                    "enabled": bool(t.get("enabled", False)),
+                    "first_rival_fraction": t.get("first_rival_fraction"),
+                    "mean_first_rival_time": t.get("mean_first_rival_time"),
+                }
+                s = t.get("streaks") or None
+                if isinstance(s, dict):
+                    summary["streaks"] = {"sanity": s.get("sanity")}
+                out["timing"] = summary
         header = "Event-queue V2 run (attacker α={:.3f})".format(args.attacker_share) if args.attacker_share is not None else "Event-queue V2 run:"
         print(header)
         print(out)
