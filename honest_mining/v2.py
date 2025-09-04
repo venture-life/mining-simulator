@@ -637,10 +637,10 @@ def simulate_mining_eventqV2(
                 })
 
             # Compact PASS/FAIL sanity summary
-            ALPHA_GLOBAL = 0.01
-            ALPHA_BIN = 0.01
-            ALPHA_TAIL = 0.01
-            ALPHA_BINOM = 0.01
+            ALPHA_GLOBAL = 0.1
+            ALPHA_BIN = 0.1
+            ALPHA_TAIL = 0.1
+            ALPHA_BINOM = 0.1
 
             num_bins = len(p_values)
             small_bins = sum(1 for pv in p_values if pv < ALPHA_BIN)
