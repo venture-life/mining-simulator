@@ -8,6 +8,7 @@ Project to simulate mining dynamics using a continuous-time event-queue model (g
   - In-time rival window `D` (seconds) controlling uncle eligibility
   - Fork-resolution dominance `k` exposed via CLI and API (`--k`), applied to the longest-chain rule
   - Optional selfish attacker via `--attacker-share α` (adds one attacker miner)
+  - Total hashrate mode via `--total-hashrate-mode {fixed_total,additive_attacker}`
 - Local-chains plotting of each miner's knowledge over time (sub-tracks per timestamp; lanes auto-scale by concurrency)
 - Deterministic tie-breaking consistent across miners
 
@@ -30,12 +31,27 @@ Project to simulate mining dynamics using a continuous-time event-queue model (g
    python run_simulation.py mining-eventq-v2 \
      --groups 2 --steps 1000 --k 3 --attacker-share 0.40 \
      --rate 0.0166667 --window 5.0 \
+     --total-hashrate-mode fixed_total \
      --local-chains --save-local-chains out/local_chains_attacker.svg
    ```
 4. CLI help for all options:
    ```bash
    python run_simulation.py mining-eventq-v2 -h
    ```
+
+### Scenario: Attacker joins before difficulty adjustment (additive_attacker)
+
+To model an attacker that joins on top of a fixed honest baseline before the difficulty retarget (so blocks arrive faster on the wall clock), use `--total-hashrate-mode additive_attacker`.
+
+- Interpretation: honest baseline stays the same; the attacker is added on top. With attacker share α of the new total, the total hashrate increases by `f = 1/(1−α)` and the global arrival rate is scaled: `Λ_eff = f · Λ`. The rival window `D` stays fixed (physical mode), so `μ = Λ · D` increases with `f`.
+- Example (α = 0.30):
+  ```bash
+  python run_simulation.py mining-eventq-v2 \
+    --groups 3 --steps 80000 --rate 0.0166667 --window 5.0 \
+    --attacker-share 0.30 --total-hashrate-mode additive_attacker \
+    --local-chains --save-local-chains out/local_chains_attacker_additive.svg
+  ```
+
 ## Example runs
 honest-run:
    ```bash
@@ -64,7 +80,11 @@ Selfish-Miner and 2 honest groups
 ## Notes
 - Event-Queue V2 uses a global Poisson process with per-delivery delays and parent repair. The in-time rival window is `D` seconds; `k` is the dominance threshold for longest-chain resolution.
 - In `mining-eventq-v2`, you can include a selfish attacker by setting `--attacker-share α ∈ (0,1)`; this adds one attacker miner as the last lane.
-- Local-chains plotting scales each miner lane by its concurrency (number of sub-tracks) by default: `scale_lanes_by_sublanes=True`, `lane_growth_per_track=0.35`. Titles include `k` automatically from the CLI.
+- When `--attacker-share` is set, provided honest `--shares` are treated as relative weights and rescaled to sum to `(1−α)`; otherwise, honest shares default to uniform `(1−α)/groups`. The attacker gets share `α` and is appended as the last miner (`index = groups`).
+- Total hashrate modes:
+  - `fixed_total` (default): α displaces honest hashrate (Σ shares = 1). Global Λ is unchanged; D is fixed.
+  - `additive_attacker`: attacker joins ON TOP of a fixed honest baseline before difficulty adjustment. Global Λ is scaled by `f = 1/(1−α)`; D is fixed. This increases `μ = Λ·D`, which typically raises FRP/uncle rates due to higher concurrency.
+- Local-chains plotting scales each miner lane by its concurrency (number of sub-tracks) by default: `scale_lanes_by_sublanes=True`, `lane_growth_per_track=0.35`. 
 - Plotting is optional and only imported when requested.
 
 ## Project Structure
@@ -72,6 +92,7 @@ Selfish-Miner and 2 honest groups
 honest_mining/
   __init__.py
   miner.py
+  selfish_miner.py
   simulator.py
   v2.py
 visualization/
