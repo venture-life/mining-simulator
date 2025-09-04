@@ -82,4 +82,4 @@ README.md
 ```
 
 ## References
-- Heilman, E., Narula, N., Tanzer, G., & Virza, M. (2020). Publish or Perish: A Backward-Compatible Defense Against Selfish Mining in Bitcoin.
+- Zhang, Ren & Preneel, Bart. (2017). Publish or Perish: A Backward-Compatible Defense Against Selfish Mining in Bitcoin. 277-292. 10.1007/978-3-319-52153-4_16.
