@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple, Callable
+from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 from .miner import Miner, Block
 
 class SelfishMiner:
@@ -19,7 +19,7 @@ class SelfishMiner:
 
     """
 
-    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", alpha: Optional[float] = None) -> None:
+    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
         self.miner_id = int(miner_id)
         self.k = int(k)
         self.tau = float(tau)
@@ -57,8 +57,13 @@ class SelfishMiner:
 
         # Initialize metrics
         self._recompute_state()
-        # Optional policy hook: Callable[[SelfishMiner, float], str]
-        self.policy: Optional[Callable[["SelfishMiner", float], str]] = (lambda m, t: m._heuristic_policy(t))
+        # Optional policy hook (pluggable): Callable[[SelfishMiner, float], PolicyResult]
+        # PolicyResult can be:
+        #   - str: action name {'adopt','override','match','even','reveal','hide'}
+        #   - dict: {'action': <name>, 'n': <int>} to specify publish count and bypass internal planning
+        #   - tuple/list: (<name>, <int>) shorthand
+        # If no policy provided, default to legacy heuristic that uses internal planner.
+        self.policy: Optional[Callable[["SelfishMiner", float], Any]] = policy if callable(policy) else (lambda m, t: m._heuristic_policy(t))
         # Local-event idempotence guards
         self._local_event_id: int = 0
         self._last_acted_event_id: int = -1
@@ -70,6 +75,8 @@ class SelfishMiner:
         # Cache for planner results per local event (for runtime performance optimization)
         self._plan_cache_event_id: int = -1
         self._plan_cache: Optional[Dict[str, Optional[int]]] = None
+        # External action plan from policy (if provided) for this local event
+        self._external_action_plan: Optional[Dict[str, Any]] = None
 
     # ------------------------- public API (mirror) -------------------------
     def on_receive(self, block: Block, received_time: float) -> None:
@@ -196,8 +203,13 @@ class SelfishMiner:
     def decide_action(self, now: float) -> str:
         """Return a PoP action to execute at time `now`.
 
-        If a custom policy is set (self.policy), use it. Otherwise, fall back to a
-        default heuristic:
+        If a custom policy is set (self.policy), use it. The policy may return a plain
+        action string or a structured plan dict/tuple to bypass internal planning:
+        - str: action name
+        - dict: {'action': name, 'n': int}
+        - tuple/list: (name, n)
+
+        Otherwise, fall back to a default heuristic:
         - If the last event was a competitor's receive and we have withheld blocks:
             * If we can match weights with minimal publish: return 'match'.
             * Else if we can override (>=k longer or heavier): return 'override'.
@@ -209,12 +221,38 @@ class SelfishMiner:
             return 'hide'
         if self.policy is not None:
             try:
-                act = self.policy(self, now)
-                if isinstance(act, str):
-                    return act
+                plan = self.policy(self, now)
+                # Reset external plan by default; set only on structured returns
+                self._external_action_plan = None
+                if isinstance(plan, str):
+                    return plan
+                # Allow tuple/list shorthand: (action, n)
+                if isinstance(plan, (tuple, list)) and len(plan) >= 1:
+                    action = str(plan[0]).strip().lower()
+                    n = None
+                    if len(plan) >= 2:
+                        try:
+                            n = int(plan[1])
+                        except Exception:
+                            n = None
+                    self._external_action_plan = {"action": action}
+                    if n is not None:
+                        self._external_action_plan["n"] = n
+                    return action
+                # Dict form with optional 'n'
+                if isinstance(plan, dict) and 'action' in plan:
+                    action = str(plan.get('action', '')).strip().lower()
+                    try:
+                        n = int(plan.get('n')) if plan.get('n') is not None else None
+                    except Exception:
+                        n = None
+                    self._external_action_plan = {"action": action}
+                    if n is not None:
+                        self._external_action_plan["n"] = n
+                    return action
             except Exception:
                 # Fall back to default heuristic on policy errors
-                pass
+                self._external_action_plan = None
 
         return self._default_policy(now)
 
@@ -376,27 +414,58 @@ class SelfishMiner:
             self._last_receive_from_competitor = False
             return []
         elif a == 'override':
-            # Use cached planning results (for runtime performance optimization)
-            n = self._get_plan(now).get('n_override')
+            # Prefer external plan if provided; else use legacy internal planner
+            n: Optional[int] = None
+            if self._external_action_plan and self._external_action_plan.get('action') == 'override':
+                try:
+                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
+                except Exception:
+                    n = None
+            if n is None:
+                n = self._get_plan(now).get('n_override')
             res = self._publish_n(now, n) if (n is not None and n > 0) else []
             self._last_receive_from_competitor = False
+            self._external_action_plan = None
             return res
         elif a == 'match':
-            # Use cached planning results (for runtime performance optimization)
-            n = self._get_plan(now).get('n_match')
+            # Prefer external plan if provided; else use legacy internal planner
+            n = None
+            if self._external_action_plan and self._external_action_plan.get('action') == 'match':
+                try:
+                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
+                except Exception:
+                    n = None
+            if n is None:
+                n = self._get_plan(now).get('n_match')
             res = self._publish_n(now, n) if (n is not None and n > 0) else []
             self._last_receive_from_competitor = False
+            self._external_action_plan = None
             return res
         elif a == 'even':
-            # Use cached planning results (for runtime performance optimization)
-            n = self._get_plan(now).get('n_even')
+            # Prefer external plan if provided; else use legacy internal planner
+            n = None
+            if self._external_action_plan and self._external_action_plan.get('action') == 'even':
+                try:
+                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
+                except Exception:
+                    n = None
+            if n is None:
+                n = self._get_plan(now).get('n_even')
             res = self._publish_n(now, n) if (n is not None and n > 0) else []
             self._last_receive_from_competitor = False
+            self._external_action_plan = None
             return res
         elif a == 'reveal' or a == 'reveal_one':
-            # Publish exactly one withheld block (classic SM: keep a one-block lead when lead >= 2)
-            res = self._publish_n(now, 1)
+            # Publish n withheld blocks if externally specified; else 1 (classic SM)
+            n = None
+            if self._external_action_plan and self._external_action_plan.get('action') in ('reveal', 'reveal_one'):
+                try:
+                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
+                except Exception:
+                    n = None
+            res = self._publish_n(now, n if (n is not None and n > 0) else 1)
             self._last_receive_from_competitor = False
+            self._external_action_plan = None
             return res
         elif a == 'hide':
             self._last_receive_from_competitor = False
@@ -614,3 +683,39 @@ class SelfishMiner:
             uncles=list(b.uncles),
             created_time=b.created_time,
         )
+
+def simple_policy_factory(reveal_on_lead: int = 2, adopt_on_competitor_when_not_ahead: bool = True) -> Callable[["SelfishMiner", float], Any]:
+    """Return a lightweight policy that avoids internal planning.
+
+    This policy uses only actions that do not require computing minimal n via the
+    planner: {'adopt','hide','reveal'}. It is intended for speed and to serve as a
+    starter hook for RL-based policies.
+
+    Behavior:
+    - If no withheld blocks:
+        * If the last perceived miner was honest and we're not ahead (lead <= 0), optionally 'adopt'.
+        * Else 'hide'.
+    - If we have withheld blocks and the last perceived miner was honest:
+        * If private lead >= reveal_on_lead: ('reveal', 1) to maintain/establish a one-block lead.
+        * Else, optionally 'adopt' when not ahead; otherwise 'hide'.
+    - After self-mining: 'hide'.
+    """
+    def _policy(m: "SelfishMiner", now: float) -> Any:
+        try:
+            lead = m.lead()
+            have_secret = len(getattr(m, "_withheld", [])) > 0
+            if not have_secret:
+                if adopt_on_competitor_when_not_ahead and m.last == 'h' and lead <= 0:
+                    return 'adopt'
+                return 'hide'
+            # React only when competitor advanced
+            if m.last == 'h':
+                if lead >= int(reveal_on_lead):
+                    return ('reveal', 1)
+                if adopt_on_competitor_when_not_ahead and lead <= 0:
+                    return 'adopt'
+                return 'hide'
+            return 'hide'
+        except Exception:
+            return 'hide'
+    return _policy
