@@ -183,22 +183,6 @@ class SelfishMiner:
         prv_head = self.private.blocks[self.private.selected_head_id]
         return int(prv_head.height) - int(pub_head.height)
 
-    def publish_all(self, now: float) -> List[Block]:
-        """
-        Publish all withheld blocks to the public view in order of creation.
-        Returns the list of published blocks (clones of the private ones).
-        """
-        published: List[Block] = []
-        for b in self._withheld:
-            cb = self._clone_block(b)
-            self.public.on_receive(cb, received_time=now)
-            published.append(cb)
-        self._withheld.clear()
-        self.selected_head_id = self.public.selected_head_id
-        # Track count and refresh metrics
-        self.published += len(published)
-        self._recompute_state()
-        return published
 
     def decide_action(self, now: float) -> str:
         """Return a PoP action to execute at time `now`.

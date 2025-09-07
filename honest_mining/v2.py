@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Callable, Any
 import heapq
 import math
 
@@ -30,6 +30,7 @@ def simulate_mining_eventqV2(
     trace: bool = False,
     trace_limit: Optional[int] = None,
     attacker_share: Optional[float] = None,
+    selfish_policy: Optional[Callable[["SelfishMiner", float], Any]] = None,
 ) -> HonestEventqResult:
     """
     Continuous-time simulation using a single global Poisson process of block arrivals with rate Λ.
@@ -102,7 +103,7 @@ def simulate_mining_eventqV2(
         # Append attacker as last index
         shares = honest_shares + [a]
         attacker_idx = groups  # attacker is last
-        miners = [Miner(miner_id=i, k=k, tau=D) for i in range(groups)] + [SelfishMiner(miner_id=attacker_idx, k=k, tau=D, alpha=a)]
+        miners = [Miner(miner_id=i, k=k, tau=D) for i in range(groups)] + [SelfishMiner(miner_id=attacker_idx, k=k, tau=D, alpha=a, policy=selfish_policy)]
 
     max_prop_delay = 0.5 * D
     if track_times:
