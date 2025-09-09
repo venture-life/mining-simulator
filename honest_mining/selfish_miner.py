@@ -41,7 +41,7 @@ class SelfishMiner:
         self._last_event: str = "init"  # one of {"init","mine","receive"}
         self._last_receive_from_competitor: bool = False
 
-        # Metrics state (Bh, Bs, Diff_w, luck, last, published)
+        # Metrics state (Bh, Bs, Diff_w, luck, luck2, last, published)
         # - Bh: public head height (honest chain length)
         # - Bs: private head height (selfish chain length)
         # - Diff_w: Wh - Ws (public chain weight minus private chain weight)
@@ -52,6 +52,7 @@ class SelfishMiner:
         self.Bs: int = 0
         self.diff_w: int = 0
         self.luck: bool = False
+        self.luck2: bool = False
         self.last: str = 'h'
         self.published: int = 0
 
@@ -119,8 +120,8 @@ class SelfishMiner:
             for sib_id in self.private.children.get(gp, []):
                 if sib_id == parent.id:
                     continue
-                if sib_id in self.private.in_time_blocks:
-                    uncles.append(sib_id)
+                # if sib_id in self.private.in_time_blocks:
+                uncles.append(sib_id)
                     
         new_block = Block(
             id=new_id,
@@ -372,10 +373,24 @@ class SelfishMiner:
                         break
                 if self.luck:
                     break
+        # Race tie-break luck (Rule 3): if best selfish and best honest heads have equal weight
+        # and the FRP deterministic tie-break would select our head in the PUBLIC view.
+        self.luck2 = False
+        try:
+            our, hon = self._split_heads(self.public)
+            if our is not None and hon is not None:
+                w_our = int(self.public.cum_block_weight.get(our.id, 0))
+                w_hon = int(self.public.cum_block_weight.get(hon.id, 0))
+                if w_our == w_hon:
+                    selected = self.public._select_head()
+                    if selected is not None and selected.id == our.id:
+                        self.luck2 = True
+        except Exception:
+            self.luck2 = False
 
-    def get_state_tuple(self) -> Tuple[int, int, int, bool, str, int]:
-        """Return (Bh, Bs, Diff_w, luck, last, published)."""
-        return (self.Bh, self.Bs, self.diff_w, self.luck, 's' if self.last == 's' else 'h', self.published)
+    def get_state_tuple(self) -> Tuple[int, int, int, bool, bool, str, int]:
+        """Return (Bh, Bs, Diff_w, luck, luck2,last, published)."""
+        return (self.Bh, self.Bs, self.diff_w, self.luck, self.luck2, 's' if self.last == 's' else 'h', self.published)
 
     # ========================= PoP action space =============================
     def act(self, action: str, now: float) -> List[Block]:
@@ -478,6 +493,8 @@ class SelfishMiner:
         """Give up private chain: align private view to public and clear withheld."""
         self.private = self._clone_miner_state(self.public)
         self._withheld.clear()
+        # Reset published counter to reflect "since adopt" semantics
+        self.published = 0
         self._recompute_state()
 
     def _plan_publish_override(self, now: float) -> Optional[int]:

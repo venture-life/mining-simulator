@@ -24,27 +24,27 @@ import random
 import logging
 
 # Public action encoding for tabular SARSA
-#   0 -> Perish (adopt)
-#   1..(k_cap+1) -> Publish(n) where n = action_id - 1, thus 1->n=1, etc.; n=0 is represented by action_id=1? No.
-# We reserve action_id=1.. for n>=1, and represent Publish(0)=hide by a dedicated id = HIDE_ID.
+#   PERISH_ID  = 0        -> Perish ('adopt')
+#   PUBLISH_ID = 1        -> Publish(0) ('hide')
+#   PUBLISH_ID + n (n>=1) -> Publish(n)
 PERISH_ID = 0
-HIDE_ID = 1  # Publish(0)
+PUBLISH_ID = 1  # Publish(0)
 
 
 def publish_id(n: int) -> int:
     """Map Publish(n) to an integer action id.
-    n==0 -> HIDE_ID. n>=1 -> HIDE_ID + n
+    n==0 -> PUBLISH_ID. n>=1 -> PUBLISH_ID + n
     """
     if n < 0:
         n = 0
-    return HIDE_ID + n
+    return PUBLISH_ID + n
 
 
 def publish_n_from_id(action_id: int) -> int:
-    """Inverse of publish_id for Publish(n) ids (including HIDE_ID as n=0)."""
-    if action_id < HIDE_ID:
+    """Inverse of publish_id for Publish(n) ids (including PUBLISH_ID as n=0)."""
+    if action_id < PUBLISH_ID:
         raise ValueError("Action id does not encode Publish(n)")
-    return action_id - HIDE_ID
+    return action_id - PUBLISH_ID
 
 
 @dataclass
@@ -68,27 +68,26 @@ class Discretizer:
     """Discretize SelfishMiner state and scenario context to a tabular key."""
 
     def __init__(self,
-                 lead_clip: int = 3,
-                 diffw_bins: Sequence[int] = (-2, -1, 0, 1, 2),
-                 mu_edges: Sequence[float] = (0.06, 0.10)) -> None:
+                 lead_clip: int = 5,
+                 diffw_bins: Sequence[int] = (-5,-4,-3,-2, -1, 0, 1, 2,3,4,5),
+                 mu_edges: Sequence[float] = (0.06, 0.10),
+                 pub_clip: int = 5) -> None:
         self.lead_clip = int(lead_clip)
         self.diffw_bins = tuple(diffw_bins)
         self.mu_edges = tuple(mu_edges)
+        self.pub_clip = int(pub_clip)
 
     def _bin_lead(self, lead: int) -> int:
-        L = max(-self.lead_clip, min(self.lead_clip, int(lead)))
-        return L
+        # L = max(-self.lead_clip, min(self.lead_clip, int(lead)))
+        # return L
+        return lead
 
     def _bin_diffw(self, dw: int) -> int:
-        if dw <= -2:
-            return -2
-        if dw == -1:
-            return -1
-        if dw == 0:
-            return 0
-        if dw == 1:
-            return 1
-        return 2
+        if dw <= -5:
+            return -5
+        if dw >= 5:
+            return 5
+        return dw
 
     def _bucket_alpha(self, a: float) -> str:
         a = float(a)
@@ -115,10 +114,10 @@ class Discretizer:
     def _bucket_mu(self, mu: float) -> str:
         mu = float(mu)
         if mu < self.mu_edges[0]:
-            return "mulo"
+            return "mulo"         # 120s block frequency with 5s window (mu=0.0416666)
         if mu < self.mu_edges[1]:
-            return "mumi"
-        return "muhi"
+            return "mumi"         # 60s block frequency with 5s window (mu=0.0833333)
+        return "muhi"             # 30s block frequency with 5s window (mu=0.1666666)
 
     def _bucket_mode(self, flag: int) -> str:
         return "m1" if int(flag) else "m0"
@@ -128,12 +127,14 @@ class Discretizer:
 
         state_key contains:
         - lead_bin ∈ [-clip..clip]
-        - diffw_bin ∈ {-2,-1,0,1,2}
+        - diffw_bin bounded by diffw_bins (default [-5..+5])
         - luck_bool ∈ {0,1}
+        - luck2_bool ∈ {0,1} (weight tie and deterministic FRP selects attacker)
         - last ∈ {h,s}
-        - withheld_count_clip ∈ [0..min(3,k)]
-        - alpha_bucket ∈ {a0,a1,a2,a3}
-        - k_bucket ∈ {k2,k3,k4p}
+        - withheld_count_clip ∈ [0..min(5,k)]
+        - published_count_clip ∈ [0..pub_clip]
+        - alpha_bucket ∈ {a0,a1,a2,a3,a4}
+        - k_bucket ∈ {k2,k3,k4,k5p}
         - mu_bucket ∈ {mulo,mumi,muhi}
         - mode_flag_bucket ∈ {m0,m1}
         """
@@ -144,33 +145,68 @@ class Discretizer:
             lead = int(getattr(miner, "lead", lambda: 0)())
         diffw = int(getattr(miner, "diff_w", 0))
         luck = 1 if bool(getattr(miner, "luck", False)) else 0
+        luck2 = 1 if bool(getattr(miner, "luck2", False)) else 0
         last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
         withheld_count = len(getattr(miner, "_withheld", []) or [])
+        published = int(getattr(miner, "published", 0))
 
         lead_b = self._bin_lead(lead)
         diffw_b = self._bin_diffw(diffw)
-        wc_cap = min(3, int(ctx.k))
-        wc_b = min(int(withheld_count), wc_cap)
+        wc_cap = min(5, int(ctx.k))
+        # wc_b = min(int(withheld_count), wc_cap)
+        wc_b = int(withheld_count)
+        # pub_b = min(max(0, int(published)), int(self.pub_clip))
+        pub_b = int(published)
         a_b = self._bucket_alpha(ctx.alpha)
         k_b = self._bucket_k(ctx.k)
         mu_b = self._bucket_mu(ctx.mu)
         mode_b = self._bucket_mode(ctx.mode_flag)
 
-        state_key = (lead_b, diffw_b, luck, last, wc_b, a_b, k_b, mu_b, mode_b)
+        state_key = (lead_b, diffw_b, luck, luck2, last, wc_b, pub_b, a_b, k_b, mu_b, mode_b)
         return state_key, int(ctx.k)
 
 
-def allowed_actions(miner: Any, k: int) -> List[int]:
-    """Return a list of action ids feasible in the current state.
+def allowed_actions(miner: Any, k: int, now: Optional[float] = None) -> List[int]:
+    """Return a list of action ids feasible in the current state at time 'now'.
 
-    Always include PERISH_ID and HIDE_ID. Include Publish(n) for n=1..min(k, withheld_count).
-    Optionally, callers may further prune using 'last' or 'lead' if desired.
+    Always include PERISH_ID ('adopt') and PUBLISH_ID ('hide').
+    Publish(n) actions are included for n in [1..min(k, withheld_count)],
+    BUT we "clip on the lower side": only include Publish(n) if n >= n_eff,
+    where n_eff is the minimal positive n that achieves either 'match' or 'override'
+    according to the miner's planner at time 'now'. If neither is achievable (no
+    positive n), no Publish(n) actions are offered.
     """
-    acts = [PERISH_ID, HIDE_ID]
+    acts = [PERISH_ID, PUBLISH_ID]
     wcnt = len(getattr(miner, "_withheld", []) or [])
     ncap = min(int(k), int(wcnt))
-    for n in range(1, ncap + 1):
-        acts.append(publish_id(n))
+    ncap = int(wcnt) # to be checked later if the above makes more sense. currenlty, publishing more than k for deeper splits / branches makes sense
+    # Determine threshold n_eff via planner if possible
+    n_eff: Optional[int] = None
+    try:
+        if now is not None:
+            # Prefer wrappers if available
+            n_match = None
+            n_over = None
+            if hasattr(miner, "_plan_publish_match"):
+                try:
+                    n_match = miner._plan_publish_match(float(now))  # type: ignore[attr-defined]
+                except Exception:
+                    n_match = None
+            if hasattr(miner, "_plan_publish_override"):
+                try:
+                    n_over = miner._plan_publish_override(float(now))  # type: ignore[attr-defined]
+                except Exception:
+                    n_over = None
+            cands = [int(n) for n in (n_match, n_over) if (n is not None and int(n) > 0)]
+            if cands:
+                n_eff = min(cands)
+    except Exception:
+        n_eff = None
+    # Add publish actions subject to threshold
+    if ncap > 0:
+        for n in range(1, ncap + 1):
+            if n_eff is None or n >= int(n_eff):
+                acts.append(publish_id(n))
     return acts
 
 
@@ -207,7 +243,7 @@ class SarsaLambda:
         If preferred is provided and is among the greedy-best actions, it will be chosen.
         """
         if not mask:
-            return HIDE_ID
+            return PUBLISH_ID
         if random.random() < self.epsilon:
             return random.choice(list(mask))
         # Greedy among mask, tie-break uniformly
@@ -285,15 +321,17 @@ class BootstrappedPolicy:
 
     def __call__(self, miner: Any, now: float) -> Any:
         s_key, k_cap = self.disc.discretize(miner, self.ctx)
-        mask = allowed_actions(miner, k_cap)
-        # Baseline preference: if last=='h' → Perish; if last=='s' → Publish(1) if feasible else Hide
+        mask = allowed_actions(miner, k_cap, now=now)
+        # Baseline preference: if last=='h' → Perish; if last=='s' → minimal allowed Publish(n) else Hide
         last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
         wcnt = len(getattr(miner, "_withheld", []) or [])
         preferred: Optional[int] = None
         if last == 'h':
             preferred = PERISH_ID
         else:
-            preferred = publish_id(1) if wcnt >= 1 else HIDE_ID
+            # Find minimal allowed Publish(n) from mask
+            publish_ids = [aid for aid in mask if aid >= PUBLISH_ID + 1]
+            preferred = (min(publish_ids) if publish_ids else PUBLISH_ID)
         a_id = self.learner.choose_action(s_key, mask, preferred=preferred)
         # Perform one-step SARSA(λ) update for the previous decision (r=0 during episode)
         if self._started and self._prev_s is not None and self._prev_a is not None:
@@ -312,6 +350,8 @@ class BootstrappedPolicy:
         # Return action in simulator's format
         if a_id == PERISH_ID:
             return 'adopt'
+        if a_id == PUBLISH_ID:
+            return 'hide'
         n = publish_n_from_id(a_id)
         return ('reveal', int(n))
 
@@ -345,19 +385,22 @@ def policy_callback_factory(learner: SarsaLambda,
     def _policy(miner: Any, now: float) -> Any:
         try:
             s_key, k_cap = disc.discretize(miner, ctx)
-            mask = allowed_actions(miner, k_cap)
-            # Baseline preference: if last=='h' → Perish; if last=='s' → Publish(1) if feasible else Hide
+            mask = allowed_actions(miner, k_cap, now=now)
+            # Baseline preference: if last=='h' → Perish; if last=='s' → minimal allowed Publish(n) else Hide
             last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
             wcnt = len(getattr(miner, "_withheld", []) or [])
             preferred: Optional[int] = None
             if last == 'h':
                 preferred = PERISH_ID
             else:
-                preferred = publish_id(1) if wcnt >= 1 else HIDE_ID
+                publish_ids = [aid for aid in mask if aid >= PUBLISH_ID + 1]
+                preferred = (min(publish_ids) if publish_ids else PUBLISH_ID)
             a_id = learner.choose_action(s_key, mask, preferred=preferred)
             if a_id == PERISH_ID:
                 return 'adopt'
-            # Publish(n) including hide via n=0
+            if a_id == PUBLISH_ID:
+                return 'hide'
+            # Publish(n) for n>=1
             n = publish_n_from_id(a_id)
             return ('reveal', int(n))
         except Exception:
@@ -375,7 +418,7 @@ if __name__ == "__main__":
     policy_cb = policy_callback_factory(agent, disc, ctx)
     # Fake miner with minimal attributes for a quick policy call
     class _Fake:
-        Bh=10; Bs=11; diff_w=0; luck=False; last='h'; _withheld=[object()]
+        Bh=10; Bs=11; diff_w=0; luck=False; luck2=False; last='h'; _withheld=[object()]
         def lead(self):
             return self.Bs - self.Bh
     fake = _Fake()

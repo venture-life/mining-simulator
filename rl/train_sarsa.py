@@ -32,22 +32,22 @@ from rl.sarsa import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train SARSA(λ) for SelfishMiner via policy injection")
-    p.add_argument("--episodes", type=int, default=20, help="Number of episodes (long runs)")
-    p.add_argument("--steps", type=int, default=10000, help="Steps per episode (simulate_mining_eventqV2)")
-    p.add_argument("--groups", type=int, default=3, help="Number of honest groups (excluding attacker)")
-    p.add_argument("--attacker-share", type=float, default=0.3, dest="attacker_share", help="Attacker hashrate α in (0,1)")
+    p.add_argument("--episodes", type=int, default=5000, help="Number of episodes (long runs)")
+    p.add_argument("--steps", type=int, default=800, help="Steps per episode (simulate_mining_eventqV2)")
+    p.add_argument("--groups", type=int, default=2, help="Number of honest groups (excluding attacker)")
+    p.add_argument("--attacker-share", type=float, default=0.4199, dest="attacker_share", help="Attacker hashrate α in (0,1)")
     p.add_argument("--k", type=int, default=3, help="Dominance threshold k")
-    p.add_argument("--rate", type=float, default=1.0/60.0, dest="Lambda", help="Global mining rate Λ (blocks/sec)")
+    p.add_argument("--rate", type=float, default=1.0/120.0, help="Global mining rate Λ (blocks/sec)")
     p.add_argument("--window", type=float, default=5.0, dest="D", help="Rival window D (seconds)")
     p.add_argument("--mode", type=str, choices=["fixed_total", "additive_attacker"], default="fixed_total",
                    help="Context flag only; does not alter the simulator here.")
     p.add_argument("--seed", type=int, default=None, help="Base RNG seed; episodes will increment it")
     p.add_argument("--gamma", type=float, default=1.0, help="Discount factor γ for SARSA")
-    p.add_argument("--lambda", type=float, default=0.9, dest="lam", help="Eligibility trace decay λ")
-    p.add_argument("--alpha", type=float, default=0.05, help="Learning rate α_lr (initial)")
-    p.add_argument("--epsilon", type=float, default=0.1, help="Exploration ε (initial)")
-    p.add_argument("--alpha-final", type=float, default=0.005, dest="alpha_final", help="Final learning rate")
-    p.add_argument("--epsilon-final", type=float, default=0.02, dest="epsilon_final", help="Final exploration")
+    p.add_argument("--lambda", type=float, default=0.98, dest="lam", help="Eligibility trace decay λ")
+    p.add_argument("--alpha", type=float, default=0.018, help="Learning rate α_lr (initial)")
+    p.add_argument("--epsilon", type=float, default=0.06, help="Exploration ε (initial)")
+    p.add_argument("--alpha-final", type=float, default=0.01, dest="alpha_final", help="Final learning rate")
+    p.add_argument("--epsilon-final", type=float, default=0.005, dest="epsilon_final", help="Final exploration")
     p.add_argument("--baseline-advantage", action="store_true", help="Use (R - α) as terminal return")
     p.add_argument("--gamma-per-second", type=float, default=1.0,
                    help="Time-aware discount base γ_per_second; effective γ at each step is γ_per_second^Δt (default 1.0)")
@@ -68,7 +68,7 @@ def main() -> None:
     args = parse_args()
 
     mode_flag = 0 if args.mode == "fixed_total" else 1
-    mu = float(args.Lambda) * float(args.D)
+    mu = float(args.rate) * float(args.D)
 
     ctx = ScenarioCtx(alpha=float(args.attacker_share), k=int(args.k), mu=mu, mode_flag=mode_flag)
     disc = Discretizer()
@@ -110,28 +110,33 @@ def main() -> None:
         ep_seed = None if base_seed is None else int(base_seed + ep)
 
         policy.start_episode()
-        res = simulate_mining_eventqV2(
-            steps=int(args.steps),
-            groups=int(args.groups),
-            Lambda=float(args.Lambda),
-            D=float(args.D),
-            k=int(args.k),
-            seed=ep_seed,
-            attacker_share=float(args.attacker_share),
-            selfish_policy=policy,
-        )
-        d: Dict[str, Any] = res.to_dict()
-        R = float(d.get("attacker_revenue_fraction", 0.0))
-        if args.baseline_advantage:
-            R = R - float(args.attacker_share)
+        R = 0.0
+        sample_runs = 2
+        for i in range(sample_runs):
+            res = simulate_mining_eventqV2(
+                steps=int(args.steps),
+                groups=int(args.groups),
+                Lambda=float(args.rate),
+                D=float(args.D),
+                k=int(args.k),
+                seed=ep_seed+i+1,
+                attacker_share=float(args.attacker_share),
+                selfish_policy=policy,
+            )
+            d: Dict[str, Any] = res.to_dict()
+            if args.baseline_advantage:
+                R = R + float(d.get("attacker_revenue_fraction", 0.0)) - float(args.attacker_share)
+            else:
+                R = R + float(d.get("attacker_revenue_fraction", 0.0))
+        R = R/sample_runs
         returns.append(R)
         # Terminal update (suppressed by alpha=0 in eval-only)
         policy.end_episode(R)
 
-        print(f"Episode {ep+1}/{args.episodes} | R={R:.4f} | ε={agent.epsilon:.3f} α={agent.alpha:.4f}")
+        print(f"Episode {ep+1}/{args.episodes} | R={R*100:.2f} | ε={agent.epsilon:.3f} α={agent.alpha:.4f}")
 
     avg_R = sum(returns) / max(1, len(returns))
-    print(f"Average return over {len(returns)} episodes: {avg_R:.4f}")
+    print(f"Average return over {len(returns)} episodes: {avg_R*100:.2f}")
 
     if args.save_q:
         # Serialize Q to a simple JSON dict with stringified keys
