@@ -125,6 +125,9 @@ class Miner:
         Called when this miner wins the lottery at time `now`.
         Select a parent head by fork-resolution rules, create a new block, embed
         eligible uncle references, and return the new block (for broadcasting).
+
+        Note: Do not deliver to self here; the simulator will schedule deliveries
+        (including to self with a tiny epsilon delay) via its event queue.
         """
         parent = self._select_head()
         # Track the selected parent head at the time of mining
@@ -144,8 +147,7 @@ class Miner:
 
         new_block = Block(id=new_id, parent_id=parent.id, miner_id=self.miner_id, height=parent.height + 1, uncles=uncles, created_time=now)
 
-        # Locally receive our own block immediately
-        self.on_receive(new_block, received_time=now)
+        # Do not deliver to self immediately; return for broadcast by simulator
         return new_block
 
     # ------------------------- internal helpers -------------------------

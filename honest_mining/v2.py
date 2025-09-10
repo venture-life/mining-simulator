@@ -33,27 +33,30 @@ def simulate_mining_eventqV2(
     selfish_policy: Optional[Callable[["SelfishMiner", float], Any]] = None,
 ) -> HonestEventqResult:
     """
-    Continuous-time simulation using a single global Poisson process of block arrivals with rate Λ.
-    Each arrival is assigned to a miner via thinning (probabilities 'shares'), and that miner mints
-    a block at that event time. The block is then gossiped to other miners via random per-delivery
-    delays with parent repair to ensure parents arrive before children.
+    Continuous-time simulation with a single global Poisson process of block arrivals (rate Λ).
+    Each arrival is assigned to a miner via thinning by shares; the winner mints immediately. The
+    resulting block is broadcast to all miners via per-delivery delays with parent repair to ensure
+    parents arrive before children. Broadcasting includes the origin miner; self-delivery uses a
+    tiny epsilon delay to serialize local publish sub-events.
 
-    By default (attacker_share is None), the model is honest-only with 'groups' miners.
-    If attacker_share in (0,1) is provided, we instantiate one SelfishMiner as the LAST miner and
-    allocate shares as follows: if 'shares' is provided, treat them as RELATIVE shares for the honest
-    groups and rescale them to sum to (1 - attacker_share); otherwise, allocate honest miners uniformly
-    with (1 - attacker_share)/groups each. The attacker gets attacker_share. Total number of miners
-    becomes G = groups + 1 in that case.
+    Policy hooks (Publish-or-Perish):
+    - After each MINE or successful DELIVER to miner i, we call i.act(t) at most once.
+    - i.act(t) returns either None or a single Block (publish-one). If a Block is returned, it is
+      broadcast immediately and will be delivered (including to i) via the event queue. Subsequent
+      publish decisions happen on subsequent DELIVER events; there is no inner streaming loop.
 
-    Local in-time classification and chain-weight selection are handled by the Miner logic. We set
-    the in-time window τ = D, use fork-resolution parameter k for longest-chain dominance, and
-    model propagation with random per-delivery delays capped at D/2 (interpreting D ≈ 2×MAX_PROPAGATION_TIME).
+    Attacker mode:
+    - If attacker_share ∈ (0,1) is provided, a SelfishMiner is appended as the last miner. If
+      honest shares are provided, they are rescaled to sum to (1−α); otherwise, they default to
+      uniform (1−α)/groups. The attacker gets share α. Total miners become groups + 1.
 
-    The simulation runs until the canonical chain (as seen by miner 0) reaches 'steps' blocks beyond
-    genesis. At the end, we compute summary metrics from miner 0's local view.
+    Miner-local behavior:
+    - In-time classification window τ = D. Fork-resolution dominance parameter k for longest-chain
+      rule. Per-delivery propagation delays are capped at D/2 (≈ 2×MAX_PROPAGATION_TIME).
 
-    If track_times=True, we compute the first rival timing per height from miner 0's view and produce
-    a histogram with 'time_bins' bins over [0, D/2].
+    The simulation stops when miner 0's canonical head reaches 'steps' beyond genesis. Summary
+    metrics are computed from miner 0's local view. If track_times=True, we also compute first-rival
+    timing histograms over [0, D/2] using 'time_bins' bins.
     """
     if steps <= 0:
         raise ValueError("steps must be > 0")
@@ -131,6 +134,8 @@ def simulate_mining_eventqV2(
         return d if d <= max_prop_delay else max_prop_delay
 
     T_REQ = 0.1  # seconds
+    # Small local time offset between successive publishes in the same event
+    EPSILON_LOCAL_PUBLISH = 0.001  # 1 ms
 
     # Global block store to enable ancestor fetch during parent repair
     block_store: Dict[str, Block] = {}
@@ -159,13 +164,14 @@ def simulate_mining_eventqV2(
     def _broadcast_block(blk: Block, gi: int, t: float) -> None:
         # Record globally for potential ancestor fetches
         block_store[blk.id] = blk
-        # Schedule deliveries to all other miners with random per-delivery delay (ordered per miner)
+        # Schedule deliveries to all miners; self gets tiny epsilon delay
         G = len(miners)
-        if G > 1:
+        if G >= 1:
             for m in miners:
                 if m.miner_id == gi:
-                    continue
-                delay = sample_delay()
+                    delay = EPSILON_LOCAL_PUBLISH
+                else:
+                    delay = sample_delay()
                 _push_event(t + delay, 0, (m.miner_id, blk, False))
     # miners already initialized above
 
@@ -232,15 +238,12 @@ def simulate_mining_eventqV2(
                     except Exception:
                         pass
             # Policy hook (only for the miner that mined)
-            decide = getattr(miners[gi], "decide_action", None)
             act = getattr(miners[gi], "act", None)
-            if callable(decide) and callable(act):
+            if callable(act):
                 try:
-                    action = decide(t)
-                    to_publish = act(action, t)
-                    if to_publish:
-                        for pb in to_publish:
-                            _broadcast_block(pb, gi, t)
+                    out = act(t)
+                    if isinstance(out, Block):
+                        _broadcast_block(out, gi, t)
                 except Exception:
                     # Keep simulator running even if a custom policy misbehaves
                     pass
@@ -290,15 +293,12 @@ def simulate_mining_eventqV2(
                         "repair": bool(repair),
                     })
                 # Policy hook (only for the miner that received)
-                decide = getattr(m, "decide_action", None)
                 act = getattr(m, "act", None)
-                if callable(decide) and callable(act):
+                if callable(act):
                     try:
-                        action = decide(t)
-                        to_publish = act(action, t)
-                        if to_publish:
-                            for pb in to_publish:
-                                _broadcast_block(pb, mid, t)
+                        out = act(t)
+                        if isinstance(out, Block):
+                            _broadcast_block(out, mid, t)
                     except Exception:
                         # Keep simulator running even if a custom policy misbehaves
                         pass

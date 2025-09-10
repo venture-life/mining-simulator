@@ -20,6 +20,7 @@ import ast
 import math
 import random
 from typing import Any, Dict, Optional
+from collections import Counter
 
 from honest_mining import simulate_mining_eventqV2
 from rl.sarsa import (
@@ -32,10 +33,10 @@ from rl.sarsa import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train SARSA(λ) for SelfishMiner via policy injection")
-    p.add_argument("--episodes", type=int, default=5000, help="Number of episodes (long runs)")
-    p.add_argument("--steps", type=int, default=800, help="Steps per episode (simulate_mining_eventqV2)")
-    p.add_argument("--groups", type=int, default=2, help="Number of honest groups (excluding attacker)")
-    p.add_argument("--attacker-share", type=float, default=0.4199, dest="attacker_share", help="Attacker hashrate α in (0,1)")
+    p.add_argument("--episodes", type=int, default=3000, help="Number of episodes (long runs)")
+    p.add_argument("--steps", type=int, default=240, help="Steps per episode (simulate_mining_eventqV2)")
+    p.add_argument("--groups", type=int, default=3, help="Number of honest groups (excluding attacker)")
+    p.add_argument("--attacker-share", type=float, default=0.4, dest="attacker_share", help="Attacker hashrate α in (0,1)")
     p.add_argument("--k", type=int, default=3, help="Dominance threshold k")
     p.add_argument("--rate", type=float, default=1.0/120.0, help="Global mining rate Λ (blocks/sec)")
     p.add_argument("--window", type=float, default=5.0, dest="D", help="Rival window D (seconds)")
@@ -43,17 +44,24 @@ def parse_args() -> argparse.Namespace:
                    help="Context flag only; does not alter the simulator here.")
     p.add_argument("--seed", type=int, default=None, help="Base RNG seed; episodes will increment it")
     p.add_argument("--gamma", type=float, default=1.0, help="Discount factor γ for SARSA")
-    p.add_argument("--lambda", type=float, default=0.98, dest="lam", help="Eligibility trace decay λ")
-    p.add_argument("--alpha", type=float, default=0.018, help="Learning rate α_lr (initial)")
-    p.add_argument("--epsilon", type=float, default=0.06, help="Exploration ε (initial)")
-    p.add_argument("--alpha-final", type=float, default=0.01, dest="alpha_final", help="Final learning rate")
-    p.add_argument("--epsilon-final", type=float, default=0.005, dest="epsilon_final", help="Final exploration")
+    p.add_argument("--lambda", type=float, default=0.99, dest="lam", help="Eligibility trace decay λ")
+    p.add_argument("--alpha", type=float, default=0.02, help="Learning rate α_lr (initial)")
+    p.add_argument("--epsilon", type=float, default=0.02, help="Exploration ε (initial)")
+    p.add_argument("--alpha-final", type=float, default=0.005, dest="alpha_final", help="Final learning rate")
+    p.add_argument("--epsilon-final", type=float, default=0.002, dest="epsilon_final", help="Final exploration")
     p.add_argument("--baseline-advantage", action="store_true", help="Use (R - α) as terminal return")
     p.add_argument("--gamma-per-second", type=float, default=1.0,
                    help="Time-aware discount base γ_per_second; effective γ at each step is γ_per_second^Δt (default 1.0)")
     p.add_argument("--save-q", type=str, default=None, help="Path to save Q-table as JSON after training/evaluation")
     p.add_argument("--load-q", type=str, default=None, help="Path to load an existing Q-table JSON before running")
     p.add_argument("--eval-only", action="store_true", help="Run evaluation only (no learning): epsilon=0, alpha=0; prints returns")
+    # Debug/bootstrapping helpers
+    p.add_argument("--last-bootstrap", action="store_true", help="Seed Q(s,·) using 'last' preference when all zeros: last=='h'→adopt, last=='s'→publish(1)")
+    p.add_argument("--last-prior", type=float, default=0.05, help="Prior strength added to preferred action when bootstrapping is triggered")
+    p.add_argument("--trace-policy", action="store_true", help="Enable per-decision policy tracing (debug logs + in-memory buffer)")
+    p.add_argument("--trace-cap", type=int, default=50000, help="Maximum number of trace entries to keep in memory when --trace-policy is set")
+    p.add_argument("--trace-out", type=str, default=None, help="Path to write per-episode traces as JSON. If contains {ep}, one file per episode; otherwise append JSON lines per episode.")
+    p.add_argument("--trace-summary", action="store_true", help="Print a concise per-episode action summary to stdout when tracing is enabled")
     return p.parse_args()
 
 
@@ -93,6 +101,11 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: failed to load Q-table from {args.load_q}: {e}")
     policy = make_bootstrapped_policy(agent, disc, ctx, gamma_per_second=float(args.gamma_per_second))
+    if args.last_bootstrap:
+        policy.enable_last_bootstrap(prior=float(args.last_prior))
+    if args.trace_policy:
+        # Ensure DEBUG logs are visible only if user configures logging externally; we keep tracing in-memory regardless
+        policy.enable_trace(debug=True, max_len=int(args.trace_cap))
 
     returns: list[float] = []
 
@@ -119,7 +132,7 @@ def main() -> None:
                 Lambda=float(args.rate),
                 D=float(args.D),
                 k=int(args.k),
-                seed=ep_seed+i+1,
+                seed=(None if ep_seed is None else int(ep_seed + i + 1)),
                 attacker_share=float(args.attacker_share),
                 selfish_policy=policy,
             )
@@ -135,6 +148,45 @@ def main() -> None:
 
         print(f"Episode {ep+1}/{args.episodes} | R={R*100:.2f} | ε={agent.epsilon:.3f} α={agent.alpha:.4f}")
 
+        # Dump traces and/or print summary if requested
+        if args.trace_policy:
+            try:
+                ep_trace = {
+                    "episode": int(ep + 1),
+                    "return": float(R),
+                    "epsilon": float(agent.epsilon),
+                    "alpha": float(agent.alpha),
+                    "decisions": list(getattr(policy, "traces", []) or []),
+                }
+                if args.trace_summary:
+                    decs = ep_trace["decisions"]
+                    acts = [int(d.get("action", 0)) for d in decs]
+                    cnt = Counter(acts)
+                    by_last = Counter((d.get("last", "?"), int(d.get("action", 0))) for d in decs)
+                    print("Trace summary:", {
+                        "N": len(decs),
+                        "actions": {str(k): int(v) for k, v in cnt.items()},
+                        "by_last": {str(k): int(v) for k, v in by_last.items()},
+                    })
+                if args.trace_out:
+                    path = str(args.trace_out)
+                    if "{ep}" in path:
+                        out_path = path.format(ep=ep + 1)
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            json.dump(ep_trace, f, ensure_ascii=False)
+                        print(f"Wrote trace to {out_path}")
+                    else:
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(ep_trace, ensure_ascii=False) + "\n")
+                        print(f"Appended episode {ep+1} trace to {path}")
+            except Exception as e:
+                print(f"Warning: failed to write trace for episode {ep+1}: {e}")
+            # Clear traces for next episode
+            try:
+                policy.traces.clear()
+            except Exception:
+                pass
+
     avg_R = sum(returns) / max(1, len(returns))
     print(f"Average return over {len(returns)} episodes: {avg_R*100:.2f}")
 
@@ -147,4 +199,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
     main()

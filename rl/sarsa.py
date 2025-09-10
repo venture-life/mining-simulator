@@ -3,17 +3,15 @@ SARSA(λ) skeleton for SelfishMiner policy learning.
 
 This module defines:
 - Discretizer: maps SelfishMiner + scenario context to a compact tabular state.
-- Masked action space with two primitives: Perish (adopt) and Publish(n).
+- Masked action space with three primitives encoded as integers:
+  -1 => adopt (perish), 0 => hide (no-op), 1 => publish exactly one block.
 - SARSA(λ) learner with eligibility traces.
-- A policy callback factory that returns actions in the format expected by SelfishMiner
-  ("adopt" or ("reveal", n)) so we bypass the internal planner.
+- Policy factories that return the integer actions expected by SelfishMiner's
+  unified decider interface (miner, now) -> int in {-1, 0, 1}.
 
-Integration notes (no code changes performed here):
-- To actually learn inside the existing simulator, `simulate_mining_eventqV2` must
-  instantiate SelfishMiner with `policy=policy_callback` (or expose a handle so you
-  can assign `miner.policy = policy_callback` after creation).
-- Until then, this module provides a runnable skeleton (unit-testable on a toy MDP)
-  and the exact callback signature required by SelfishMiner.
+Integration notes:
+- To learn inside the simulator, pass the returned policy as `selfish_policy`
+  to `simulate_mining_eventqV2` so the SelfishMiner uses it directly.
 """
 from __future__ import annotations
 
@@ -23,28 +21,8 @@ import math
 import random
 import logging
 
-# Public action encoding for tabular SARSA
-#   PERISH_ID  = 0        -> Perish ('adopt')
-#   PUBLISH_ID = 1        -> Publish(0) ('hide')
-#   PUBLISH_ID + n (n>=1) -> Publish(n)
-PERISH_ID = 0
-PUBLISH_ID = 1  # Publish(0)
-
-
-def publish_id(n: int) -> int:
-    """Map Publish(n) to an integer action id.
-    n==0 -> PUBLISH_ID. n>=1 -> PUBLISH_ID + n
-    """
-    if n < 0:
-        n = 0
-    return PUBLISH_ID + n
-
-
-def publish_n_from_id(action_id: int) -> int:
-    """Inverse of publish_id for Publish(n) ids (including PUBLISH_ID as n=0)."""
-    if action_id < PUBLISH_ID:
-        raise ValueError("Action id does not encode Publish(n)")
-    return action_id - PUBLISH_ID
+# New action space: integers {-1, 0, 1}
+# -1 => adopt (perish), 0 => hide, 1 => publish one withheld block
 
 
 @dataclass
@@ -71,16 +49,17 @@ class Discretizer:
                  lead_clip: int = 5,
                  diffw_bins: Sequence[int] = (-5,-4,-3,-2, -1, 0, 1, 2,3,4,5),
                  mu_edges: Sequence[float] = (0.06, 0.10),
-                 pub_clip: int = 5) -> None:
+                 pub_clip: int = 5,
+                 withheld_cap: int = 8) -> None:
         self.lead_clip = int(lead_clip)
         self.diffw_bins = tuple(diffw_bins)
         self.mu_edges = tuple(mu_edges)
         self.pub_clip = int(pub_clip)
+        self.wc_cap = int(withheld_cap)
 
     def _bin_lead(self, lead: int) -> int:
-        # L = max(-self.lead_clip, min(self.lead_clip, int(lead)))
-        # return L
-        return lead
+        L = max(-self.lead_clip, min(self.lead_clip, int(lead)))
+        return L
 
     def _bin_diffw(self, dw: int) -> int:
         if dw <= -5:
@@ -127,11 +106,10 @@ class Discretizer:
 
         state_key contains:
         - lead_bin ∈ [-clip..clip]
-        - diffw_bin bounded by diffw_bins (default [-5..+5])
-        - luck_bool ∈ {0,1}
-        - luck2_bool ∈ {0,1} (weight tie and deterministic FRP selects attacker)
+        - diffw_bin (private-public) bounded by diffw_bins (default [-5..+5])
+        - luck_bool ∈ {0,1} (when withholding and diff_w==0, FRP on cf selects attacker)
         - last ∈ {h,s}
-        - withheld_count_clip ∈ [0..min(5,k)]
+        - withheld_count_clip ∈ [0..withheld_cap] (cap independent of k)
         - published_count_clip ∈ [0..pub_clip]
         - alpha_bucket ∈ {a0,a1,a2,a3,a4}
         - k_bucket ∈ {k2,k3,k4,k5p}
@@ -140,73 +118,54 @@ class Discretizer:
         """
         # Pull dynamic fields from SelfishMiner
         try:
-            lead = int(miner.Bs) - int(miner.Bh) if hasattr(miner, "Bs") and hasattr(miner, "Bh") else int(miner.lead())
-        except Exception:
+            lead = int(miner.lead())
+        except Exception as e:
+            logging.exception("Discretizer: miner.lead() failed; using fallback lead() attr")
             lead = int(getattr(miner, "lead", lambda: 0)())
         diffw = int(getattr(miner, "diff_w", 0))
         luck = 1 if bool(getattr(miner, "luck", False)) else 0
-        luck2 = 1 if bool(getattr(miner, "luck2", False)) else 0
         last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
         withheld_count = len(getattr(miner, "_withheld", []) or [])
         published = int(getattr(miner, "published", 0))
 
         lead_b = self._bin_lead(lead)
         diffw_b = self._bin_diffw(diffw)
-        wc_cap = min(5, int(ctx.k))
-        # wc_b = min(int(withheld_count), wc_cap)
-        wc_b = int(withheld_count)
-        # pub_b = min(max(0, int(published)), int(self.pub_clip))
-        pub_b = int(published)
+        wc_b = min(int(withheld_count), int(self.wc_cap))
+        pub_b = min(max(0, int(published)), int(self.pub_clip))
         a_b = self._bucket_alpha(ctx.alpha)
         k_b = self._bucket_k(ctx.k)
         mu_b = self._bucket_mu(ctx.mu)
         mode_b = self._bucket_mode(ctx.mode_flag)
 
-        state_key = (lead_b, diffw_b, luck, luck2, last, wc_b, pub_b, a_b, k_b, mu_b, mode_b)
+        state_key = (lead_b, diffw_b, luck, last, wc_b, pub_b, a_b, k_b, mu_b, mode_b)
         return state_key, int(ctx.k)
 
 
 def allowed_actions(miner: Any, k: int, now: Optional[float] = None) -> List[int]:
-    """Return a list of action ids feasible in the current state at time 'now'.
+    """Return masked actions in {-1, 0, 1} based on current miner state.
 
-    Always include PERISH_ID ('adopt') and PUBLISH_ID ('hide').
-    Publish(n) actions are included for n in [1..min(k, withheld_count)],
-    BUT we "clip on the lower side": only include Publish(n) if n >= n_eff,
-    where n_eff is the minimal positive n that achieves either 'match' or 'override'
-    according to the miner's planner at time 'now'. If neither is achievable (no
-    positive n), no Publish(n) actions are offered.
+    Rules
+    -----
+    - If no withheld blocks: only -1 (adopt). There is nothing to hide or publish.
+    - If withholding (withheld_count > 0): always allow 0 (hide) and 1 (publish-one).
+      Allow -1 (adopt) unless the last miner was selfish AND the last event was 'mine'
+      (never adopt immediately after our own mine).
+
+    Parameter k is unused but kept for signature stability.
     """
-    acts = [PERISH_ID, PUBLISH_ID]
     wcnt = len(getattr(miner, "_withheld", []) or [])
-    ncap = min(int(k), int(wcnt))
-    ncap = int(wcnt) # to be checked later if the above makes more sense. currenlty, publishing more than k for deeper splits / branches makes sense
-    # Determine threshold n_eff via planner if possible
-    n_eff: Optional[int] = None
-    try:
-        if now is not None:
-            # Prefer wrappers if available
-            n_match = None
-            n_over = None
-            if hasattr(miner, "_plan_publish_match"):
-                try:
-                    n_match = miner._plan_publish_match(float(now))  # type: ignore[attr-defined]
-                except Exception:
-                    n_match = None
-            if hasattr(miner, "_plan_publish_override"):
-                try:
-                    n_over = miner._plan_publish_override(float(now))  # type: ignore[attr-defined]
-                except Exception:
-                    n_over = None
-            cands = [int(n) for n in (n_match, n_over) if (n is not None and int(n) > 0)]
-            if cands:
-                n_eff = min(cands)
-    except Exception:
-        n_eff = None
-    # Add publish actions subject to threshold
-    if ncap > 0:
-        for n in range(1, ncap + 1):
-            if n_eff is None or n >= int(n_eff):
-                acts.append(publish_id(n))
+    if int(wcnt) <= 0:
+        # No secret chain: only adopt is meaningful (and will be a no-op in SelfishMiner when wc==0)
+        return [-1]
+
+    # Withholding: allow hide and publish-one by default
+    acts: List[int] = [0, 1]
+
+    # Consider adopt unless it would immediately discard a fresh selfish-mined block
+    last_event = str(getattr(miner, "_last_event", ""))
+    last_sym = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+    if not (last_sym == 's' and last_event == "mine"):
+        acts.append(-1)
     return acts
 
 
@@ -243,7 +202,7 @@ class SarsaLambda:
         If preferred is provided and is among the greedy-best actions, it will be chosen.
         """
         if not mask:
-            return PUBLISH_ID
+            return 0  # default to hide if no actions given
         if random.random() < self.epsilon:
             return random.choice(list(mask))
         # Greedy among mask, tie-break uniformly
@@ -311,6 +270,46 @@ class BootstrappedPolicy:
         self._prev_a: Optional[int] = None
         self._prev_t: Optional[float] = None
         self._started: bool = False
+        # Tracing/debug
+        self.debug: bool = False
+        self.traces: List[Dict[str, Any]] = []
+        self._trace_cap: int = 100000
+        # Optional last-based Q bootstrap (honest-baseline): if all Q(s,·)==0, seed
+        self.bootstrap_last: bool = False
+        self.last_prior: float = 0.05
+
+    def enable_trace(self, debug: bool = True, *, max_len: Optional[int] = None) -> None:
+        """Enable per-decision tracing for debugging. Set max_len to cap buffer size."""
+        self.debug = bool(debug)
+        if max_len is not None:
+            try:
+                self._trace_cap = max(1, int(max_len))
+            except Exception as e:
+                logging.exception("BootstrappedPolicy.enable_trace: invalid max_len=%r", max_len)
+
+    def enable_last_bootstrap(self, prior: float = 0.05) -> None:
+        """Enable lazy Q seeding based solely on 'last'.
+
+        If all Q(s,·) for the current masked actions are exactly zero, we set
+        Q(s, a_pref) += prior where a_pref = (-1 if last=='h' else 1 if allowed else 0).
+        This biases the initial policy to honest-miner behavior without precomputing
+        the entire state-space. Learning updates proceed normally thereafter.
+        """
+        self.bootstrap_last = True
+        try:
+            self.last_prior = float(prior)
+        except Exception as e:
+            logging.exception("BootstrappedPolicy.enable_last_bootstrap: invalid prior=%r; defaulting to 0.05", prior)
+            self.last_prior = 0.05
+
+    def _append_trace(self, entry: Dict[str, Any]) -> None:
+        try:
+            self.traces.append(entry)
+            if len(self.traces) > self._trace_cap:
+                # drop from the front (keep recent)
+                self.traces = self.traces[-self._trace_cap:]
+        except Exception as e:
+            logging.exception("BootstrappedPolicy._append_trace failed; entry truncated")
 
     def start_episode(self) -> None:
         self.learner.reset_traces()
@@ -322,24 +321,81 @@ class BootstrappedPolicy:
     def __call__(self, miner: Any, now: float) -> Any:
         s_key, k_cap = self.disc.discretize(miner, self.ctx)
         mask = allowed_actions(miner, k_cap, now=now)
-        # Baseline preference: if last=='h' → Perish; if last=='s' → minimal allowed Publish(n) else Hide
+        # Baseline preference: if last=='h' → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
         last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
-        wcnt = len(getattr(miner, "_withheld", []) or [])
         preferred: Optional[int] = None
         if last == 'h':
-            preferred = PERISH_ID
+            preferred = -1
         else:
-            # Find minimal allowed Publish(n) from mask
-            publish_ids = [aid for aid in mask if aid >= PUBLISH_ID + 1]
-            preferred = (min(publish_ids) if publish_ids else PUBLISH_ID)
+            preferred = 1 if (1 in mask) else 0
+
+        # Snapshot Q-values for masked actions prior to selection (for debugging)
+        try:
+            q_vals = {int(a): float(self.learner._q(s_key, int(a))) for a in mask}
+            if q_vals:
+                max_q = max(q_vals.values())
+                best_actions = [a for a, v in q_vals.items() if v == max_q]
+            else:
+                best_actions = []
+        except Exception as e:
+            logging.exception("BootstrappedPolicy.__call__: snapshot Q-values failed; proceeding with empty q_vals"); q_vals = {}; best_actions = []
+
+        # Optional: last-based Q bootstrap when all Q(s,·) are zero/equal
+        if self.bootstrap_last:
+            try:
+                all_zero = (len(q_vals) > 0) and all(abs(v) == 0.0 for v in q_vals.values())
+            except Exception as e:
+                logging.exception("BootstrappedPolicy.__call__: all_zero check failed; skipping bootstrap")
+                all_zero = False
+            if all_zero:
+                seed_action = preferred if preferred in mask else (0 if 0 in mask else (mask[0] if mask else 0))
+                try:
+                    self.learner._set_q(s_key, int(seed_action), self.learner._q(s_key, int(seed_action)) + float(self.last_prior))
+                    # refresh local snapshot
+                    q_vals[int(seed_action)] = self.learner._q(s_key, int(seed_action))
+                    max_q = max(q_vals.values())
+                    best_actions = [a for a, v in q_vals.items() if v == max_q]
+                except Exception as e:
+                    logging.exception("BootstrappedPolicy.__call__: failed to bootstrap Q at preferred action=%s", seed_action)
+
         a_id = self.learner.choose_action(s_key, mask, preferred=preferred)
+        is_greedy = bool(a_id in best_actions) if best_actions else True
+
+        # Optional trace entry
+        if self.debug:
+            try:
+                # Pull a few raw features for readability
+                lead = int(getattr(miner, "lead", lambda: 0)())
+                luck = int(bool(getattr(miner, "luck", False)))
+                last_sym = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+                wcnt = int(len(getattr(miner, "_withheld", []) or []))
+                pubd = int(getattr(miner, "published", 0))
+                entry = {
+                    "t": float(now),
+                    "state_key": s_key,
+                    "lead": lead,
+                    "luck": luck,
+                    "last": last_sym,
+                    "withheld": wcnt,
+                    "published": pubd,
+                    "mask": list(mask),
+                    "preferred": int(preferred) if preferred is not None else None,
+                    "q": q_vals,
+                    "action": int(a_id),
+                    "greedy": bool(is_greedy),
+                }
+                self._append_trace(entry)
+                logging.debug("SARSA decision t=%.6f a=%s greedy=%s mask=%s q=%s state=%s", now, a_id, is_greedy, mask, q_vals, s_key)
+            except Exception as e:
+                logging.exception("BootstrappedPolicy.__call__: failed to append debug trace entry")
         # Perform one-step SARSA(λ) update for the previous decision (r=0 during episode)
         if self._started and self._prev_s is not None and self._prev_a is not None:
             gamma_eff: Optional[float] = None
             if self.gamma_per_second != 1.0 and self._prev_t is not None:
                 try:
                     dt = max(0.0, float(now) - float(self._prev_t))
-                except Exception:
+                except Exception as e:
+                    logging.exception("BootstrappedPolicy.__call__: failed to compute dt; using 0.0")
                     dt = 0.0
                 gamma_eff = float(self.gamma_per_second) ** float(dt)
             self.learner.update(self._prev_s, self._prev_a, r=0.0, s_next=s_key, a_next=a_id, gamma_override=gamma_eff)
@@ -347,13 +403,11 @@ class BootstrappedPolicy:
         self._prev_s = s_key
         self._prev_a = a_id
         self._prev_t = float(now)
-        # Return action in simulator's format
-        if a_id == PERISH_ID:
-            return 'adopt'
-        if a_id == PUBLISH_ID:
-            return 'hide'
-        n = publish_n_from_id(a_id)
-        return ('reveal', int(n))
+        # Return integer action for SelfishMiner: -1 adopt, 0 hide, 1 publish-one
+        if a_id not in (-1, 0, 1):
+            # Safety clamp in case of unexpected mask
+            a_id = 0
+        return a_id
 
     def end_episode(self, final_return: float) -> None:
         """Apply terminal update with final_return and reset traces for next episode."""
@@ -375,37 +429,31 @@ def make_bootstrapped_policy(learner: SarsaLambda, disc: Discretizer, ctx: Scena
 
 def policy_callback_factory(learner: SarsaLambda,
                             disc: Discretizer,
-                            ctx: ScenarioCtx) -> Callable[[Any, float], Any]:
-    """Return a SelfishMiner-compatible policy callback.
+                            ctx: ScenarioCtx) -> Callable[[Any, float], int]:
+    """Return a SelfishMiner-compatible policy callback returning -1/0/1.
 
     The callback inspects the current SelfishMiner state, discretizes it, selects a masked
-    action with ε-greedy SARSA policy, and returns either 'adopt' (Perish) or ('reveal', n)
-    for Publish(n). It does not block, and it does not access any global planner.
+    action with ε-greedy SARSA policy, and returns -1 (adopt), 0 (hide), or 1 (publish-one).
     """
     def _policy(miner: Any, now: float) -> Any:
         try:
             s_key, k_cap = disc.discretize(miner, ctx)
             mask = allowed_actions(miner, k_cap, now=now)
-            # Baseline preference: if last=='h' → Perish; if last=='s' → minimal allowed Publish(n) else Hide
+            # Baseline preference: if last=='h' → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
             last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
-            wcnt = len(getattr(miner, "_withheld", []) or [])
             preferred: Optional[int] = None
             if last == 'h':
-                preferred = PERISH_ID
+                preferred = -1
             else:
-                publish_ids = [aid for aid in mask if aid >= PUBLISH_ID + 1]
-                preferred = (min(publish_ids) if publish_ids else PUBLISH_ID)
+                preferred = 1 if (1 in mask) else 0
             a_id = learner.choose_action(s_key, mask, preferred=preferred)
-            if a_id == PERISH_ID:
-                return 'adopt'
-            if a_id == PUBLISH_ID:
-                return 'hide'
-            # Publish(n) for n>=1
-            n = publish_n_from_id(a_id)
-            return ('reveal', int(n))
-        except Exception:
+            if a_id not in (-1, 0, 1):
+                a_id = 0
+            return a_id
+        except Exception as e:
+            logging.exception("policy_callback_factory: policy call failed; returning hide(0)")
             # Fallback to safe no-op
-            return 'hide'
+            return 0
     return _policy
 
 
@@ -418,10 +466,10 @@ if __name__ == "__main__":
     policy_cb = policy_callback_factory(agent, disc, ctx)
     # Fake miner with minimal attributes for a quick policy call
     class _Fake:
-        Bh=10; Bs=11; diff_w=0; luck=False; luck2=False; last='h'; _withheld=[object()]
+        Bh=10; Bs=11; luck=False; last='h'; _withheld=[object()]
         def lead(self):
             return self.Bs - self.Bh
     fake = _Fake()
     act = policy_cb(fake, now=0.0)
-    print("Policy callback smoke test:", act)
-    print("RL SARSA(λ) skeleton ready. Integrate with simulator by passing policy=policy_cb to SelfishMiner.")
+    print("Policy callback smoke test (-1/0/1):", act)
+    print("RL SARSA(λ) skeleton ready. Integrate with simulator by passing policy=policy_cb (returns -1/0/1) to SelfishMiner.")

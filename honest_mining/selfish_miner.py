@@ -1,22 +1,36 @@
 from __future__ import annotations
 
+import math
+import random
+import logging
 from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 from .miner import Miner, Block
+from . import policy as sm_policy
+
+logger = logging.getLogger(__name__)
 
 class SelfishMiner:
     """
     Wrapper around two Miner instances to support selfish-mining strategies.
 
-    This class keeps:
-    - a public view (what is broadcast/known by the network), and
-    - a private view (which may include withheld blocks mined by this miner).
+    Views:
+    - public: what is broadcast/known by the network
+    - private: may include withheld blocks mined by this miner
 
-    It mirrors the Miner API (on_receive/on_mine) so it can be used in place of
-    Miner by the simulator. For now, on_mine defaults to honest-compatible
-    behavior (immediate broadcast) to remain compatible with the current
-    simulator, while still maintaining a private view that can diverge if/when
-    a withholding policy is enabled at the simulator level.
+    API:
+    - on_mine(now): mines on the PRIVATE head and WITHHOLDS (returns None)
+    - on_receive(block, t): deliver a block to the PUBLIC view
+    - act(now): calls a unified policy decider (miner, now) -> int in {-1,0,1}
+        -1 => adopt (align PRIVATE with PUBLIC and clear withheld)
+         0 => hide (no-op)
+         1 => publish exactly one withheld block (returns Block)
 
+    Publishing semantics:
+    - act(now) returns at most one withheld Block which the simulator broadcasts.
+    - The simulator delivers to all miners—INCLUDING SELF—via its event queue.
+      Self-delivery uses a tiny epsilon delay to serialize local sub-events.
+    - Subsequent publish decisions occur on subsequent DELIVER events (no inner
+      tight loop inside a single simulator event).
     """
 
     def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
@@ -34,50 +48,52 @@ class SelfishMiner:
         # Queue of withheld blocks (kept only in private view until published)
         self._withheld: List[Block] = []
 
-        # Mirror commonly read attributes for compatibility (updated from public)
-        self.selected_head_id: str = self.public.selected_head_id
 
         # Track last event context to drive minimal publishing logic
         self._last_event: str = "init"  # one of {"init","mine","receive"}
         self._last_receive_from_competitor: bool = False
 
-        # Metrics state (Bh, Bs, Diff_w, luck, luck2, last, published)
+        # Metrics state (Bh, Bs, Diff_w, luck, last, published)
         # - Bh: public head height (honest chain length)
         # - Bs: private head height (selfish chain length)
         # - Diff_w: Wh - Ws (public chain weight minus private chain weight)
-        # - luck: True if there exists a withheld non-late block that embeds an honest in-time uncle
         # - last: 'h' or 's' (miner of the last mined block as perceived by this agent)
         # - published: number of withheld blocks we have published so far
         self.Bh: int = 0
         self.Bs: int = 0
         self.diff_w: int = 0
         self.luck: bool = False
-        self.luck2: bool = False
         self.last: str = 'h'
         self.published: int = 0
 
         # Initialize metrics
         self._recompute_state()
-        # Optional policy hook (pluggable): Callable[[SelfishMiner, float], PolicyResult]
-        # PolicyResult can be:
-        #   - str: action name {'adopt','override','match','even','reveal','hide'}
-        #   - dict: {'action': <name>, 'n': <int>} to specify publish count and bypass internal planning
-        #   - tuple/list: (<name>, <int>) shorthand
-        # If no policy provided, default to legacy heuristic that uses internal planner.
-        self.policy: Optional[Callable[["SelfishMiner", float], Any]] = policy if callable(policy) else (lambda m, t: m._heuristic_policy(t))
-        # Local-event idempotence guards
+        # Optional policy hook (pluggable):
+        # - External policy (callable) should return an int in {-1, 0, 1} mapping to:
+        #   -1 -> adopt, 0 -> hide, 1 -> publish_one
+        # - External stepper: object with .step(miner, now) -> int in {-1,0,1}
+        # - If none provided, default to heuristic base policy composed with a StreamingStepper
+        #   whose step(miner, now) returns int in {-1,0,1}.
+        self.policy: Optional[Callable[["SelfishMiner", float], Any]] = (policy if callable(policy) else sm_policy.heuristic_policy)
+        if callable(policy):
+            # Use external as-decider directly: fn(self, now)->int or obj.step(self, now)->int
+            if hasattr(policy, 'step') and callable(getattr(policy, 'step')):
+                self._decide_fn = getattr(policy, 'step')  # type: ignore[assignment]
+            else:
+                self._decide_fn = policy  # type: ignore[assignment]
+            self._stepper = None  # not used for external policies
+        else:
+            # Internal default: wrap heuristic base policy in a StreamingStepper (int-returning)
+            self._stepper = sm_policy.make_streaming_stepper(self.policy)
+            self._decide_fn = self._stepper.step
+        # Local-event id tracking (used for debugging/trace alignment)
         self._local_event_id: int = 0
-        self._last_acted_event_id: int = -1
         # Attacker's own hashrate share (alpha) if known; influences policy aggressiveness
         try:
             self.alpha: Optional[float] = (float(alpha) if alpha is not None else None)
-        except Exception:
+        except Exception as e:
+            logger.exception("Failed to parse alpha '%s'; defaulting to None", alpha)
             self.alpha = None
-        # Cache for planner results per local event (for runtime performance optimization)
-        self._plan_cache_event_id: int = -1
-        self._plan_cache: Optional[Dict[str, Optional[int]]] = None
-        # External action plan from policy (if provided) for this local event
-        self._external_action_plan: Optional[Dict[str, Any]] = None
 
     # ------------------------- public API (mirror) -------------------------
     def on_receive(self, block: Block, received_time: float) -> None:
@@ -86,18 +102,26 @@ class SelfishMiner:
         We must clone the incoming block to avoid cross-view mutation of fields
         like height during connection.
         """
-        pb = self._clone_block(block)
-        rb = self._clone_block(block)
-        self.public.on_receive(pb, received_time)
-        self.private.on_receive(rb, received_time)
-        self.selected_head_id = self.public.selected_head_id
-        # Remember that we just processed a receive event, and whether it was a competitor's block
+        # Always clone for PUBLIC deliver to avoid cross-view mutation
+        pb_pub = self._clone_block(block)
+        self.public.on_receive(pb_pub, received_time)
+        
         self._last_event = "receive"
         self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
         if self._last_receive_from_competitor:
             self.last = 'h'
-        # Update metrics after processing receive
-        self._recompute_state()
+            # Only mirror into PRIVATE when we are not withholding; this keeps
+            # private aligned with public in honest/no-withhold regimes, and avoids
+            # contaminating the private view during withholding.
+            if not self._withheld:
+                # Clone the entire PUBLIC view into PRIVATE to guarantee parent-known invariant.
+                # Calling private.on_receive directly can violate ordered-delivery assumptions.
+                self.private = self._clone_miner_state(self.public)
+            else:
+                # While withholding, do NOT deliver competitor blocks into PRIVATE.
+                # PRIVATE only tracks our withheld chain; it will be reconciled with PUBLIC
+                # upon adopt/publish via _clone_miner_state to maintain parent-known invariants.
+                pass
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
 
@@ -105,23 +129,31 @@ class SelfishMiner:
         """
         Mine a block on the PRIVATE head and WITHHOLD it (return None).
 
-        The simulator's V2 loop will call a policy via decide_action() and then act()
-        after each event to determine if/what to publish.
+        Publishing a withheld block is treated as a local PoP sub-event: the
+        simulator may call act(now) multiple times at the same simulation time t.
+        Each publish immediately updates the public chain and all local state,
+        after which the policy is consulted again on the new state to decide
+        whether to publish another withheld block.
         """
-        # Select private head to extend
-        parent = self.private._select_head()
+        # Choose parent:
+        # - If withholding, extend the private withheld tip to keep the secret chain contiguous.
+        # - Otherwise, mine on the FRP-selected private head (honest behavior when not withholding).
+        if self._withheld:
+            parent = self._withheld[-1]
+        else:
+            parent = self.private._select_head()
         new_id = f"{self.miner_id}:{self._next_seq}"
         self._next_seq += 1
 
-        # Determine uncles: siblings of parent that are in-time (from this miner's view)
+        # Determine uncles: siblings of parent that are in-time (from PUBLIC knowledge)
         uncles: List[str] = []
         if parent.parent_id is not None:
             gp = parent.parent_id
-            for sib_id in self.private.children.get(gp, []):
+            for sib_id in self.public.children.get(gp, []):
                 if sib_id == parent.id:
                     continue
-                # if sib_id in self.private.in_time_blocks:
-                uncles.append(sib_id)
+                if sib_id in self.public.in_time_blocks:
+                    uncles.append(sib_id)
                     
         new_block = Block(
             id=new_id,
@@ -137,12 +169,14 @@ class SelfishMiner:
         self._withheld.append(new_block)
         self._last_event = "mine"
         self.last = 's'
-        # Update metrics after mining
-        self._recompute_state()
-        # Do not change self.selected_head_id: mirrors PUBLIC view
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
         return None
+
+    # Backward/alternate naming: mirror "deliver" terminology used at simulator level
+    def on_deliver(self, block: Block, received_time: float) -> None:
+        """Alias for on_receive for API clarity."""
+        return self.on_receive(block, received_time)
 
     # ------------------------- view forwarding (read-only) -----------------
     @property
@@ -181,313 +215,142 @@ class SelfishMiner:
     def lead(self) -> int:
         """Return private_head_height - public_head_height."""
         pub_head = self.public.blocks[self.public.selected_head_id]
-        prv_head = self.private.blocks[self.private.selected_head_id]
+        # If withholding, measure lead against the current withheld tip;
+        # otherwise, use the FRP-selected private head.
+        if self._withheld:
+            prv_head = self._withheld[-1]
+        else:
+            prv_head = self.private._select_head()
         return int(prv_head.height) - int(pub_head.height)
 
 
-    def decide_action(self, now: float) -> str:
-        """Return a PoP action to execute at time `now`.
-
-        If a custom policy is set (self.policy), use it. The policy may return a plain
-        action string or a structured plan dict/tuple to bypass internal planning:
-        - str: action name
-        - dict: {'action': name, 'n': int}
-        - tuple/list: (name, n)
-
-        Otherwise, fall back to a default heuristic:
-        - If the last event was a competitor's receive and we have withheld blocks:
-            * If we can match weights with minimal publish: return 'match'.
-            * Else if we can override (>=k longer or heavier): return 'override'.
-            * Else: 'hide'.
-        - Otherwise: 'hide'.
-        """
-        # Idempotence-by-event: if we've already acted for this local event, do nothing
-        if self._local_event_id == self._last_acted_event_id:
-            return 'hide'
-        if self.policy is not None:
-            try:
-                plan = self.policy(self, now)
-                # Reset external plan by default; set only on structured returns
-                self._external_action_plan = None
-                if isinstance(plan, str):
-                    return plan
-                # Allow tuple/list shorthand: (action, n)
-                if isinstance(plan, (tuple, list)) and len(plan) >= 1:
-                    action = str(plan[0]).strip().lower()
-                    n = None
-                    if len(plan) >= 2:
-                        try:
-                            n = int(plan[1])
-                        except Exception:
-                            n = None
-                    self._external_action_plan = {"action": action}
-                    if n is not None:
-                        self._external_action_plan["n"] = n
-                    return action
-                # Dict form with optional 'n'
-                if isinstance(plan, dict) and 'action' in plan:
-                    action = str(plan.get('action', '')).strip().lower()
-                    try:
-                        n = int(plan.get('n')) if plan.get('n') is not None else None
-                    except Exception:
-                        n = None
-                    self._external_action_plan = {"action": action}
-                    if n is not None:
-                        self._external_action_plan["n"] = n
-                    return action
-            except Exception:
-                # Fall back to default heuristic on policy errors
-                self._external_action_plan = None
-
-        return self._default_policy(now)
-
-    def _default_policy(self, now: float) -> str:
-        if not self._withheld:
-            # Nothing to reveal
-            self._last_receive_from_competitor = False
-            return 'hide'
-        if self._last_event == 'receive' and self._last_receive_from_competitor:
-            # Prefer weight tie if feasible
-            n_match = self._plan_publish_match(now)
-            if n_match is not None:
-                # Do not reset the competitor flag here; v2 will call act() next
-                return 'match'
-            n_override = self._plan_publish_override(now)
-            if n_override is not None:
-                return 'override'
-            return 'hide'
-        # Default: keep withholding
-        return 'hide'
-
-    def _heuristic_policy(self, now: float) -> str:
-        """Simple heuristic based on the 6-tuple metrics and action feasibility.
-
-        Uses (Bh, Bs, Diff_w, luck, last, published) to decide among
-        {adopt, match, override, even, hide}. Consults the planner helpers to
-        ensure the chosen action is feasible under current state.
-
-        Preference (when last == 'h' and we have withheld):
-        - Prefer the action that achieves the goal with the smallest positive n.
-          Typically override > match > even, but if override is much costlier
-          and a cheap match exists (especially when lucky), choose match.
-        - If nothing feasible and we are not ahead: adopt; else hide.
-
-        After self-mining (last == 's'): keep withholding (hide).
-
-        Adaptivity by (alpha, k):
-        - For alpha >= ~1/3: more aggressive overriding (allow higher publish cost).
-        - For 1/4 <= alpha < 1/3: prefer match; allow only cheap overrides.
-        - For alpha < 1/4 or unknown: conservative; avoid overrides unless trivially cheap.
-        - Smaller k slightly increases willingness to override.
-        """
-        lead = int(self.Bs) - int(self.Bh)
-        have_secret = len(self._withheld) > 0
-        a = float(self.alpha) if self.alpha is not None else 0.0
-        k = int(self.k)
-
-        # No secrets to reveal
-        if not have_secret:
-            # If competitor just advanced and we're not ahead, align with public
-            if self.last == 'h' and self.Bs <= self.Bh:
-                return 'adopt'
-            return 'hide'
-
-        # React only when the last perceived miner was honest (competitor)
-        if self.last == 'h':
-            n_over = self._plan_publish_override(now)
-            n_match = self._plan_publish_match(now)
-            n_even = self._plan_publish_even(now)
-
-            # Normalize to positive ints where applicable
-            over_ok = (n_over is not None and n_over > 0)
-            match_ok = (n_match is not None and n_match > 0)
-            even_ok = (n_even is not None and n_even > 0)
-
-            # Alpha- and k-adaptive aggressiveness thresholds
-            # Allowance for overriding cost (in number of blocks to publish)
-            if a >= 1.0/3.0:
-                allow_over = 2
-            elif a >= 1.0/4.0:
-                allow_over = 1
-            else:
-                allow_over = 0
-            # Smaller k -> easier to win by length; increase allowance slightly
-            if k <= 2:
-                allow_over += 1
-
-            # Prefer override when it's cheap enough and not much worse than alternatives
-            if over_ok and n_over <= allow_over and (not match_ok or n_over <= n_match) and (not even_ok or n_over <= n_even) and not self.luck:
-                return 'override'
-            # Prefer match when feasible, especially when lucky or override is costly
-            if match_ok and (not over_ok or n_match < n_over or self.luck or n_over > allow_over):
-                return 'match'
-            # If we have a private lead >= 2 and k is small (<=2), reveal one to maintain a one-block lead
-            # only when override isn't feasible; for larger k, keep withholding to try to reach k-dominance
-            if lead >= 2 and not over_ok and k <= 2:
-                return 'reveal'
-            # High-alpha fallback: still take override if feasible (even if costly)
-            if over_ok and a >= 1.0/3.0:
-                return 'override'
-            # Even as a last resort to maintain height competitiveness
-            if even_ok and (a >= 1.0/3.0 or (a >= 1.0/4.0 and k <= 2)):
-                return 'even'
-
-            # If we cannot improve and we're not ahead, give up
-            if lead <= 0:
-                return 'adopt'
-            return 'hide'
-
-        # After self-mining, prefer to keep building the private lead
-        return 'hide'
+    
 
     # ------------------------- metrics and state ---------------------------
-    def _recompute_state(self) -> None:
+    def _recompute_state(self, *, now: Optional[float] = None) -> None:
         """Recompute the selfish-miner state tuple components.
 
-        Bh = public head height; Bs = private head height;
-        Diff_w = Wh - Ws; luck as defined in the prompt; last and published kept incrementally.
+        Diff_w = Wh - Ws; last and published kept incrementally.
         """
-        # Heads
-        pub_head = self.public.blocks[self.public.selected_head_id]
-        prv_head = self.private.blocks[self.private.selected_head_id]
-        self.Bh = int(pub_head.height)
-        self.Bs = int(prv_head.height)
-        # Weights
-        Wh = int(self.public.cum_block_weight.get(pub_head.id, 0))
-        Ws = int(self.private.cum_block_weight.get(prv_head.id, 0))
+        # Use IDs for weight lookups
+        pub_head_id = self.public.selected_head_id
+        cf = None  # type: Optional[Miner]
+        # Compute Ws as counterfactual "if we published now" when time is provided and we are withholding
+        if now is not None and self._withheld:
+            prv_head_id = self._withheld[-1].id
+            cf = self._build_counterfactual_public(float(now))
+            Ws = int(cf.cum_block_weight.get(prv_head_id, 0))
+        else:
+            prv_head_id = (self._withheld[-1].id if self._withheld else self.private.selected_head_id)
+            Ws = int(self.private.cum_block_weight.get(prv_head_id, 0))
+        # Public head weight
+        Wh = int(self.public.cum_block_weight.get(pub_head_id, 0))
         self.diff_w = Wh - Ws
-        # Lucky block detection among withheld blocks
-        self.luck = False
-        if self._withheld:
-            in_time_private = self.private.in_time_blocks
-            for b in self._withheld:
-                if b.id not in in_time_private:
-                    continue  # secret but late → not lucky
-                # Any honest in-time uncle?
-                for u in b.uncles:
-                    ub = self.private.blocks.get(u)
-                    if ub is None:
-                        continue
-                    if u in in_time_private and (ub.miner_id is not None and int(ub.miner_id) != self.miner_id):
-                        self.luck = True
-                        break
-                if self.luck:
-                    break
-        # Race tie-break luck (Rule 3): if best selfish and best honest heads have equal weight
-        # and the FRP deterministic tie-break would select our head in the PUBLIC view.
-        self.luck2 = False
-        try:
-            our, hon = self._split_heads(self.public)
-            if our is not None and hon is not None:
-                w_our = int(self.public.cum_block_weight.get(our.id, 0))
-                w_hon = int(self.public.cum_block_weight.get(hon.id, 0))
-                if w_our == w_hon:
-                    selected = self.public._select_head()
-                    if selected is not None and selected.id == our.id:
-                        self.luck2 = True
-        except Exception:
-            self.luck2 = False
 
-    def get_state_tuple(self) -> Tuple[int, int, int, bool, bool, str, int]:
-        """Return (Bh, Bs, Diff_w, luck, luck2,last, published)."""
-        return (self.Bh, self.Bs, self.diff_w, self.luck, self.luck2, 's' if self.last == 's' else 'h', self.published)
+        # Race tie-break luck (counterfactual): when withholding and diff_w==0,
+        # publish-now counterfactual selects OUR head under deterministic FRP.
+        self.luck = False
+        try:
+            if cf is not None and int(self.diff_w) == 0:
+                selected = cf._select_head()
+                if selected is not None and selected.miner_id is not None:
+                    self.luck = (int(selected.miner_id) == self.miner_id)
+        except Exception as e:
+            logger.exception("luck (counterfactual) computation failed; resetting luck=False")
+            self.luck = False
+
+    def _build_counterfactual_public(self, now: float) -> Miner:
+        """Clone PUBLIC and deliver all withheld blocks with V2-like timing starting at `now`."""
+        cf = self._clone_miner_state(self.public)
+        try:
+            # # sample_delay() ~ lognormal, capped at max_prop_delay = 0.5 * tau
+            # max_prop_delay = 0.5 * float(self.tau)
+            # if max_prop_delay <= 0.0:
+            #     initial_delay = 0.0
+            # else:
+            #     sigma = 0.6
+            #     mu = math.log(max(max_prop_delay / 2.0, 1e-9)) - 0.5 * sigma * sigma
+            #     d = random.lognormvariate(mu, sigma)
+            #     initial_delay = d if d <= max_prop_delay else max_prop_delay
+            initial_delay = 2.5
+            EPSILON_LOCAL_PUBLISH = 0.001
+            t_cur = float(now) + float(initial_delay) + EPSILON_LOCAL_PUBLISH
+
+            # If we have previously published part of our secret chain (popped from _withheld)
+            # but PUBLIC has not yet seen those blocks (due to self-delivery epsilon in the simulator),
+            # then cf (a clone of PUBLIC) may be missing parents of the current first withheld block.
+            # Bridge any missing ancestor chain from PRIVATE before delivering the current withheld list.
+            delivered_ids: Set[str] = set()
+            if self._withheld:
+                try:
+                    parent_id = self._withheld[0].parent_id
+                    missing_ancestors: List[Block] = []
+                    while parent_id is not None and parent_id not in cf.blocks:
+                        pb = self.private.blocks.get(parent_id)
+                        if pb is None:
+                            break
+                        missing_ancestors.append(pb)
+                        parent_id = pb.parent_id
+                    # Deliver oldest ancestor first to satisfy parent-known invariant
+                    for anc in reversed(missing_ancestors):
+                        if anc.id in delivered_ids:
+                            continue
+                        cf.on_receive(self._clone_block(anc), received_time=t_cur)
+                        delivered_ids.add(anc.id)
+                        t_cur += EPSILON_LOCAL_PUBLISH
+                except Exception:
+                    # Best-effort; if we cannot repair ancestors from PRIVATE, proceed to try withheld list
+                    pass
+
+            # Now deliver the current withheld list in order
+            for wb in self._withheld:
+                if wb.id in delivered_ids:
+                    continue
+                cf.on_receive(self._clone_block(wb), received_time=t_cur)
+                delivered_ids.add(wb.id)
+                t_cur += EPSILON_LOCAL_PUBLISH
+        except Exception as e:
+            logger.exception("Counterfactual delivery failed while building cf PUBLIC; proceeding with partial state")
+        return cf
+
 
     # ========================= PoP action space =============================
-    def act(self, action: str, now: float) -> List[Block]:
-        """Execute a PoP action and return blocks to broadcast.
+    def act(self, now: float) -> Optional[Block]:
+        """Perform one streaming decision step (via decider) and execute it.
 
-        Supported actions:
-        - 'adopt': discard private fork and follow public chain
-        - 'override': publish minimal blocks to dominate (by k-length or weight)
-        - 'match': publish minimal blocks to match weights (create a fair tie under weight FRP)
-        - 'even': publish minimal blocks to reach >= height but lower weight
-        - 'reveal'/'reveal_one': publish exactly one withheld block (used to maintain a one-block lead when lead >= 2)
-        - 'hide': keep withholding (no publish)
+        Decider interface: returns an int in {-1, 0, 1}
+        -1 => adopt (perish)
+         0 => hide (no-op)
+         1 => publish exactly one withheld block (if any)
         """
-        # Mark that we've acted for the current local event (at-most-once per event)
-        self._last_acted_event_id = self._local_event_id
-        a = (action or '').strip().lower()
-        if a == 'adopt':
-            self._adopt_public()
-            # Clear competitor flag after acting so we don't react repeatedly to the same event
-            self._last_receive_from_competitor = False
-            return []
-        elif a == 'override':
-            # Prefer external plan if provided; else use legacy internal planner
-            n: Optional[int] = None
-            if self._external_action_plan and self._external_action_plan.get('action') == 'override':
-                try:
-                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
-                except Exception:
-                    n = None
-            if n is None:
-                n = self._get_plan(now).get('n_override')
-            res = self._publish_n(now, n) if (n is not None and n > 0) else []
-            self._last_receive_from_competitor = False
-            self._external_action_plan = None
-            return res
-        elif a == 'match':
-            # Prefer external plan if provided; else use legacy internal planner
-            n = None
-            if self._external_action_plan and self._external_action_plan.get('action') == 'match':
-                try:
-                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
-                except Exception:
-                    n = None
-            if n is None:
-                n = self._get_plan(now).get('n_match')
-            res = self._publish_n(now, n) if (n is not None and n > 0) else []
-            self._last_receive_from_competitor = False
-            self._external_action_plan = None
-            return res
-        elif a == 'even':
-            # Prefer external plan if provided; else use legacy internal planner
-            n = None
-            if self._external_action_plan and self._external_action_plan.get('action') == 'even':
-                try:
-                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
-                except Exception:
-                    n = None
-            if n is None:
-                n = self._get_plan(now).get('n_even')
-            res = self._publish_n(now, n) if (n is not None and n > 0) else []
-            self._last_receive_from_competitor = False
-            self._external_action_plan = None
-            return res
-        elif a == 'reveal' or a == 'reveal_one':
-            # Publish n withheld blocks if externally specified; else 1 (classic SM)
-            n = None
-            if self._external_action_plan and self._external_action_plan.get('action') in ('reveal', 'reveal_one'):
-                try:
-                    n = int(self._external_action_plan.get('n')) if self._external_action_plan.get('n') is not None else None
-                except Exception:
-                    n = None
-            res = self._publish_n(now, n if (n is not None and n > 0) else 1)
-            self._last_receive_from_competitor = False
-            self._external_action_plan = None
-            return res
-        elif a == 'hide':
-            self._last_receive_from_competitor = False
-            return []
-        else:
-            raise ValueError(f"Unknown action: {action}")
+
+        # Recompute policy-relevant metrics at the current decision time
+        self._recompute_state(now=now)
+
+        # Call decider with the unified interface (miner, now) -> int
+        try:
+            decision = int(self._decide_fn(self, now))  # type: ignore[misc]
+        except Exception as e:
+            logger.exception("Policy decider raised; defaulting decision=0")
+            decision = 0
+
+        if decision < 0:
+            if self._withheld:
+                self._adopt_public()
+            return None
+        if decision > 0:
+            return self._publish_one(now)
+        return None
 
     # ------------------------- action helpers ------------------------------
-    def _publish_n(self, now: float, n: int) -> List[Block]:
-        """Publish the first n withheld blocks (oldest-first)."""
-        if n is None or n <= 0:
-            return []
-        n = min(int(n), len(self._withheld))
-        published: List[Block] = []
-        for _ in range(n):
-            b = self._withheld.pop(0)
-            cb = self._clone_block(b)
-            self.public.on_receive(cb, received_time=now)
-            published.append(cb)
-        self.selected_head_id = self.public.selected_head_id
-        self.published += len(published)
-        self._recompute_state()
-        return published
+    def _publish_one(self, now: float) -> Optional[Block]:
+        """Publish exactly one withheld block if available; return the block or None."""
+        if not self._withheld:
+            return None
+        b = self._withheld.pop(0)
+        # Do not deliver to self here; simulator will broadcast (including self) with epsilon
+        self.published += 1
+        return b
 
     def _adopt_public(self) -> None:
         """Give up private chain: align private view to public and clear withheld."""
@@ -495,22 +358,8 @@ class SelfishMiner:
         self._withheld.clear()
         # Reset published counter to reflect "since adopt" semantics
         self.published = 0
-        self._recompute_state()
 
-    def _plan_publish_override(self, now: float) -> Optional[int]:
-        """Wrapper that retrieves the precomputed minimal n for override.
-        Uses a shared incremental plan (for runtime performance optimization)."""
-        return self._get_plan(now).get('n_override')
 
-    def _plan_publish_match(self, now: float) -> Optional[int]:
-        """Wrapper that retrieves the precomputed minimal n for match.
-        Uses a shared incremental plan (for runtime performance optimization)."""
-        return self._get_plan(now).get('n_match')
-
-    def _plan_publish_even(self, now: float) -> Optional[int]:
-        """Wrapper that retrieves the precomputed minimal n for even.
-        Uses a shared incremental plan (for runtime performance optimization)."""
-        return self._get_plan(now).get('n_even')
 
     # ------------------------- cloning and selection utils -----------------
     def _clone_miner_state(self, src: Miner) -> Miner:
@@ -547,130 +396,7 @@ class SelfishMiner:
         dst.selected_head_id = src.selected_head_id
         return dst
 
-    # ------------------------- shared planning helpers ---------------------
-    def _get_plan(self, now: float) -> Dict[str, Optional[int]]:
-        """Return cached or freshly computed minimal n for {override, match, even}.
-        Results are cached per local event id (for runtime performance optimization)."""
-        if self._plan_cache_event_id == self._local_event_id and self._plan_cache is not None:
-            return self._plan_cache
-        plan = self._plan_all(now)
-        self._plan_cache_event_id = self._local_event_id
-        self._plan_cache = plan
-        return plan
 
-    def _plan_all(self, now: float) -> Dict[str, Optional[int]]:
-        """Compute minimal n for override/match/even using a single clone and incremental
-        application of withheld blocks (for runtime performance optimization)."""
-        max_n = len(self._withheld)
-        if max_n == 0:
-            return {"n_override": None, "n_match": None, "n_even": None}
-
-        m = self._clone_miner_state(self.public)
-        n_override: Optional[int] = None
-        n_match: Optional[int] = None
-        n_even: Optional[int] = None
-
-        def eval_conditions(n_cur: int) -> None:
-            nonlocal n_override, n_match, n_even
-            our, hon = self._split_heads(m)
-            if our is None:
-                return
-            if hon is None:
-                if n_override is None:
-                    n_override = n_cur
-                return
-            hdiff = int(our.height) - int(hon.height)
-            wdiff = int(m.cum_block_weight.get(our.id, 0)) - int(m.cum_block_weight.get(hon.id, 0))
-            # override condition: dominance by length (>=k) or by weight; and FRP selects our head
-            if n_override is None:
-                if self.k > 0 and hdiff >= self.k:
-                    # If k>0 and we are >=k blocks ahead by height, Rule 1 guarantees our chain wins.
-                    n_override = n_cur
-                else:
-                    selected = m._select_head()
-                    # Preserve original semantics for cases where fast path doesn't apply (incl. k==0)
-                    if ((self.k > 0 and hdiff >= self.k) or (wdiff > 0)) and (selected.id == our.id):
-                        n_override = n_cur
-            # match condition: equal weights (best selfish vs best honest) AND FRP would select our head
-            if n_match is None and wdiff == 0:
-                selected2 = m._select_head()
-                if selected2.id == our.id:
-                    n_match = n_cur
-            # even condition: height >= and weight <
-            if n_even is None and (hdiff >= 0 and wdiff < 0):
-                n_even = n_cur
-
-        # Evaluate n=0 (no publications)
-        eval_conditions(0)
-        if n_override is not None and n_match is not None and n_even is not None:
-            return {"n_override": n_override, "n_match": n_match, "n_even": n_even}
-
-        # Incrementally publish withheld blocks on the clone and re-evaluate
-        for i in range(max_n):
-            cb = self._clone_block(self._withheld[i])
-            m.on_receive(cb, received_time=now)
-            eval_conditions(i + 1)
-            if n_override is not None and n_match is not None and n_even is not None:
-                break
-
-        return {"n_override": n_override, "n_match": n_match, "n_even": n_even}
-
-    def _split_heads(self, m: Miner) -> Tuple[Optional[Block], Optional[Block]]:
-        """Return (best_selfish_head, best_honest_head) among current leaves.
-
-        Optimized: scan leaves by descending height using m.leaves_by_height, and for
-        each height select the best candidate by weight (then deterministic tie-break).
-        Falls back to scanning all leaves if the index is unavailable.
-        """
-        lbh = getattr(m, 'leaves_by_height', None)
-        if not isinstance(lbh, dict) or not lbh:
-            # Fallback to the original implementation using the flat leaf set
-            leaves = [m.blocks[bid] for bid in m.leaves]
-            our_heads = [b for b in leaves if b.miner_id is not None and int(b.miner_id) == self.miner_id]
-            hon_heads = [b for b in leaves if b.miner_id is None or int(b.miner_id) != self.miner_id]
-
-            def _best_fallback(heads: List[Block]) -> Optional[Block]:
-                if not heads:
-                    return None
-                max_h = max(b.height for b in heads)
-                cands_h = [b for b in heads if b.height == max_h]
-                max_w = max(m.cum_block_weight.get(b.id, 0) for b in cands_h)
-                cands_w = [b for b in cands_h if m.cum_block_weight.get(b.id, 0) == max_w]
-                if len(cands_w) == 1:
-                    return cands_w[0]
-                chosen_id = m._deterministic_choice([b.id for b in cands_w])
-                return m.blocks[chosen_id]
-
-            return _best_fallback(our_heads), _best_fallback(hon_heads)
-
-        max_h = int(m.max_height)
-
-        def _best_group(is_selfish: bool) -> Optional[Block]:
-            # Scan from top height down until we find any candidate of this group
-            for h in range(max_h, -1, -1):
-                ids = lbh.get(h)
-                if not ids:
-                    continue
-                cand_ids: List[str] = []
-                for bid in ids:
-                    b = m.blocks[bid]
-                    mine = (b.miner_id is not None and int(b.miner_id) == self.miner_id)
-                    if is_selfish and mine:
-                        cand_ids.append(bid)
-                    elif (not is_selfish) and (b.miner_id is None or int(b.miner_id) != self.miner_id):
-                        cand_ids.append(bid)
-                if not cand_ids:
-                    continue
-                # Tie-break among this height by weight then deterministic choice
-                max_w = max(m.cum_block_weight.get(bid, 0) for bid in cand_ids)
-                best_ids = [bid for bid in cand_ids if m.cum_block_weight.get(bid, 0) == max_w]
-                if len(best_ids) == 1:
-                    return m.blocks[best_ids[0]]
-                chosen_id = m._deterministic_choice(best_ids)
-                return m.blocks[chosen_id]
-            return None
-
-        return _best_group(True), _best_group(False)
 
     # ------------------------- internals -----------------------------------
     @staticmethod
@@ -685,38 +411,4 @@ class SelfishMiner:
             created_time=b.created_time,
         )
 
-def simple_policy_factory(reveal_on_lead: int = 2, adopt_on_competitor_when_not_ahead: bool = True) -> Callable[["SelfishMiner", float], Any]:
-    """Return a lightweight policy that avoids internal planning.
-
-    This policy uses only actions that do not require computing minimal n via the
-    planner: {'adopt','hide','reveal'}. It is intended for speed and to serve as a
-    starter hook for RL-based policies.
-
-    Behavior:
-    - If no withheld blocks:
-        * If the last perceived miner was honest and we're not ahead (lead <= 0), optionally 'adopt'.
-        * Else 'hide'.
-    - If we have withheld blocks and the last perceived miner was honest:
-        * If private lead >= reveal_on_lead: ('reveal', 1) to maintain/establish a one-block lead.
-        * Else, optionally 'adopt' when not ahead; otherwise 'hide'.
-    - After self-mining: 'hide'.
-    """
-    def _policy(m: "SelfishMiner", now: float) -> Any:
-        try:
-            lead = m.lead()
-            have_secret = len(getattr(m, "_withheld", [])) > 0
-            if not have_secret:
-                if adopt_on_competitor_when_not_ahead and m.last == 'h' and lead <= 0:
-                    return 'adopt'
-                return 'hide'
-            # React only when competitor advanced
-            if m.last == 'h':
-                if lead >= int(reveal_on_lead):
-                    return ('reveal', 1)
-                if adopt_on_competitor_when_not_ahead and lead <= 0:
-                    return 'adopt'
-                return 'hide'
-            return 'hide'
-        except Exception:
-            return 'hide'
-    return _policy
+    
