@@ -63,7 +63,7 @@ class SelfishMiner:
         self.Bs: int = 0
         self.diff_w: int = 0
         self.luck: bool = False
-        self.last: str = 'h'
+        self.last: str = 'h0'
         self.published: int = 0
 
         # Initialize metrics
@@ -94,6 +94,11 @@ class SelfishMiner:
         except Exception as e:
             logger.exception("Failed to parse alpha '%s'; defaulting to None", alpha)
             self.alpha = None
+        # Policy-controlled toggle: when hiding and not withholding, prefer mining on the
+        # second-last block if the selected head is not ours but its parent is ours.
+        # Set this from the policy via: miner.prefer_second_last_on_hide = True/False
+        # to be explored some day
+        # self.prefer_second_last_on_hide: bool = False
 
     # ------------------------- public API (mirror) -------------------------
     def on_receive(self, block: Block, received_time: float) -> None:
@@ -109,19 +114,13 @@ class SelfishMiner:
         self._last_event = "receive"
         self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
         if self._last_receive_from_competitor:
-            self.last = 'h'
-            # Only mirror into PRIVATE when we are not withholding; this keeps
-            # private aligned with public in honest/no-withhold regimes, and avoids
-            # contaminating the private view during withholding.
-            if not self._withheld:
-                # Clone the entire PUBLIC view into PRIVATE to guarantee parent-known invariant.
-                # Calling private.on_receive directly can violate ordered-delivery assumptions.
-                self.private = self._clone_miner_state(self.public)
+            if self.public.blocks[block.parent_id].miner_id == self.miner_id:
+                self.last = 'h1'
             else:
-                # While withholding, do NOT deliver competitor blocks into PRIVATE.
-                # PRIVATE only tracks our withheld chain; it will be reconciled with PUBLIC
-                # upon adopt/publish via _clone_miner_state to maintain parent-known invariants.
-                pass
+                self.last = 'h0'
+        else:
+            self.last = 's1'
+
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
 
@@ -137,11 +136,13 @@ class SelfishMiner:
         """
         # Choose parent:
         # - If withholding, extend the private withheld tip to keep the secret chain contiguous.
-        # - Otherwise, mine on the FRP-selected private head (honest behavior when not withholding).
-        if self._withheld:
-            parent = self._withheld[-1]
-        else:
-            parent = self.private._select_head()
+        # - Otherwise, choose parent based on ownership of the selected head or its parent.
+        # if self._withheld:
+        #     parent = self._withheld[-1]
+        # else:
+
+        parent = self.private._select_head()
+
         new_id = f"{self.miner_id}:{self._next_seq}"
         self._next_seq += 1
 
@@ -168,7 +169,7 @@ class SelfishMiner:
         self.private.on_receive(new_block, received_time=now)
         self._withheld.append(new_block)
         self._last_event = "mine"
-        self.last = 's'
+        self.last = 's0'
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
         return None
@@ -215,16 +216,9 @@ class SelfishMiner:
     def lead(self) -> int:
         """Return private_head_height - public_head_height."""
         pub_head = self.public.blocks[self.public.selected_head_id]
-        # If withholding, measure lead against the current withheld tip;
-        # otherwise, use the FRP-selected private head.
-        if self._withheld:
-            prv_head = self._withheld[-1]
-        else:
-            prv_head = self.private._select_head()
+        prv_head = self.private.blocks[self.private.selected_head_id]
+
         return int(prv_head.height) - int(pub_head.height)
-
-
-    
 
     # ------------------------- metrics and state ---------------------------
     def _recompute_state(self, *, now: Optional[float] = None) -> None:
@@ -234,33 +228,28 @@ class SelfishMiner:
         """
         # Use IDs for weight lookups
         pub_head_id = self.public.selected_head_id
+        self.luck = False
         cf = None  # type: Optional[Miner]
         # Compute Ws as counterfactual "if we published now" when time is provided and we are withholding
         if now is not None and self._withheld:
             prv_head_id = self._withheld[-1].id
-            cf = self._build_counterfactual_public(float(now))
+            cf = self._build_counterfactual_public(float(now),only_first = False)
             Ws = int(cf.cum_block_weight.get(prv_head_id, 0))
         else:
-            prv_head_id = (self._withheld[-1].id if self._withheld else self.private.selected_head_id)
+            prv_head_id = self.private.selected_head_id
             Ws = int(self.private.cum_block_weight.get(prv_head_id, 0))
-        # Public head weight
+
         Wh = int(self.public.cum_block_weight.get(pub_head_id, 0))
         self.diff_w = Wh - Ws
 
-        # Race tie-break luck (counterfactual): when withholding and diff_w==0,
-        # publish-now counterfactual selects OUR head under deterministic FRP.
-        self.luck = False
-        try:
-            if cf is not None and int(self.diff_w) == 0:
-                selected = cf._select_head()
-                if selected is not None and selected.miner_id is not None:
-                    self.luck = (int(selected.miner_id) == self.miner_id)
-        except Exception as e:
-            logger.exception("luck (counterfactual) computation failed; resetting luck=False")
-            self.luck = False
 
-    def _build_counterfactual_public(self, now: float) -> Miner:
-        """Clone PUBLIC and deliver all withheld blocks with V2-like timing starting at `now`."""
+
+    def _build_counterfactual_public(self, now: float, *, only_first: bool = False) -> Miner:
+        """Clone PUBLIC and deliver withheld blocks with V2-like timing starting at `now`.
+
+        If only_first is True, deliver only the first withheld block (plus any missing ancestors).
+        Otherwise, deliver the entire withheld list in order (plus any missing ancestors for the first).
+        """
         cf = self._clone_miner_state(self.public)
         try:
             # # sample_delay() ~ lognormal, capped at max_prop_delay = 0.5 * tau
@@ -272,8 +261,8 @@ class SelfishMiner:
             #     mu = math.log(max(max_prop_delay / 2.0, 1e-9)) - 0.5 * sigma * sigma
             #     d = random.lognormvariate(mu, sigma)
             #     initial_delay = d if d <= max_prop_delay else max_prop_delay
-            initial_delay = 2.5
-            EPSILON_LOCAL_PUBLISH = 0.001
+            initial_delay = 0.01
+            EPSILON_LOCAL_PUBLISH = 0.000
             t_cur = float(now) + float(initial_delay) + EPSILON_LOCAL_PUBLISH
 
             # If we have previously published part of our secret chain (popped from _withheld)
@@ -299,14 +288,24 @@ class SelfishMiner:
                         delivered_ids.add(anc.id)
                         t_cur += EPSILON_LOCAL_PUBLISH
                 except Exception:
-                    # Best-effort; if we cannot repair ancestors from PRIVATE, proceed to try withheld list
-                    pass
+                    logger.exception("Counterfactual metric computation impaired due to missing ancestors; we could not repair ancestors from PRIVATE, proceeding ...")
 
-            # Now deliver the current withheld list in order
-            for wb in self._withheld:
+            # Now deliver the current withheld set according to mode (first-only or all)
+            to_deliver = []
+            if self._withheld:
+                if only_first:
+                    to_deliver = [self._withheld[0]]
+                else:
+                    to_deliver = list(self._withheld)
+
+            for wb in to_deliver:
                 if wb.id in delivered_ids:
                     continue
                 cf.on_receive(self._clone_block(wb), received_time=t_cur)
+                if wb.id == self._withheld[0].id:
+                    selected = cf._select_head()
+                    if selected is not None and selected.miner_id is not None:
+                        self.luck = (int(selected.miner_id) == self.miner_id)
                 delivered_ids.add(wb.id)
                 t_cur += EPSILON_LOCAL_PUBLISH
         except Exception as e:
@@ -335,8 +334,7 @@ class SelfishMiner:
             decision = 0
 
         if decision < 0:
-            if self._withheld:
-                self._adopt_public()
+            self._adopt_public()
             return None
         if decision > 0:
             return self._publish_one(now)

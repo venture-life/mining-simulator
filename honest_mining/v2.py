@@ -23,6 +23,7 @@ def simulate_mining_eventqV2(
     shares: Optional[List[float]] = None,
     Lambda: float = 1.0 / 60.0,
     D: float = 5.0,
+    max_prop_delay: float = 2.5,
     k: int = 3,
     seed: Optional[int] = None,
     track_times: bool = False,
@@ -52,11 +53,11 @@ def simulate_mining_eventqV2(
 
     Miner-local behavior:
     - In-time classification window τ = D. Fork-resolution dominance parameter k for longest-chain
-      rule. Per-delivery propagation delays are capped at D/2 (≈ 2×MAX_PROPAGATION_TIME).
+    - rule. Per-delivery propagation delays are capped at max_prop_delay (default 2.5s).
 
     The simulation stops when miner 0's canonical head reaches 'steps' beyond genesis. Summary
     metrics are computed from miner 0's local view. If track_times=True, we also compute first-rival
-    timing histograms over [0, D/2] using 'time_bins' bins.
+    timing histograms over [0, max_prop_delay] using 'time_bins' bins.
     """
     if steps <= 0:
         raise ValueError("steps must be > 0")
@@ -108,7 +109,8 @@ def simulate_mining_eventqV2(
         attacker_idx = groups  # attacker is last
         miners = [Miner(miner_id=i, k=k, tau=D) for i in range(groups)] + [SelfishMiner(miner_id=attacker_idx, k=k, tau=D, alpha=a, policy=selfish_policy)]
 
-    max_prop_delay = 0.5 * D
+    # max propagation delay is now an independent parameter (default 2.5s), not tied to D
+    max_prop_delay = float(max_prop_delay)
     if track_times:
         if time_bins <= 0:
             raise ValueError("time_bins must be > 0 when track_times=True")
@@ -123,19 +125,22 @@ def simulate_mining_eventqV2(
     winners = [] if track_times else None
 
     # Network delay sampling (right-skew) and parent-repair parameters
-    # - sample_delay(): lognormal with mean ~= max_prop_delay/2, capped at max_prop_delay (0..D/2)
+    # - sample_delay(connectivity_boost): lognormal with mean ~= eff_max/2, capped at eff_max
+    #   where eff_max = max_prop_delay normally, and eff_max = max_prop_delay/250 when
+    #   connectivity_boost=True (e.g., when an attacker endpoint is involved).
     # - T_REQ: small request/response overhead per missing ancestor during repair
-    def sample_delay() -> float:
-        if max_prop_delay <= 0.0:
+    def sample_delay(connectivity_boost: bool = False) -> float:
+        eff_max = max_prop_delay / 250 if connectivity_boost else max_prop_delay
+        if eff_max <= 0.0:
             return 0.0
         sigma = 0.6  # right-skew
-        mu = math.log(max(max_prop_delay / 2.0, 1e-9)) - 0.5 * sigma * sigma
+        mu = math.log(max(eff_max / 2.0, 1e-9)) - 0.5 * sigma * sigma
         d = float(rng.lognormal(mean=mu, sigma=sigma))
-        return d if d <= max_prop_delay else max_prop_delay
+        return d if d <= eff_max else eff_max
 
-    T_REQ = 0.1  # seconds
+    T_REQ = 0.00  # shit is not needed
     # Small local time offset between successive publishes in the same event
-    EPSILON_LOCAL_PUBLISH = 0.001  # 1 ms
+    EPSILON_LOCAL_PUBLISH = 0.000  # 0.1 ms
 
     # Global block store to enable ancestor fetch during parent repair
     block_store: Dict[str, Block] = {}
@@ -171,7 +176,9 @@ def simulate_mining_eventqV2(
                 if m.miner_id == gi:
                     delay = EPSILON_LOCAL_PUBLISH
                 else:
-                    delay = sample_delay()
+                    # Apply connectivity boost when either endpoint is the attacker
+                    boost = bool(attacker_idx is not None and (gi == attacker_idx or m.miner_id == attacker_idx))
+                    delay = sample_delay(connectivity_boost=boost) + 2*EPSILON_LOCAL_PUBLISH
                 _push_event(t + delay, 0, (m.miner_id, blk, False))
     # miners already initialized above
 
@@ -271,7 +278,9 @@ def simulate_mining_eventqV2(
                     pb = block_store.get(bid)
                     if pb is None:
                         continue
-                    t_cur = t_cur + T_REQ + sample_delay()
+                    # Apply connectivity boost when either endpoint is the attacker
+                    boost = bool(attacker_idx is not None and ((getattr(pb, "miner_id", None) == attacker_idx) or (mid == attacker_idx)))
+                    t_cur = t_cur + T_REQ + sample_delay(connectivity_boost=boost)
                     _push_event(t_cur, 0, (mid, pb, True))
 
                 # Reschedule the child to arrive after its parents
@@ -291,6 +300,9 @@ def simulate_mining_eventqV2(
                         "block_id": blk.id,
                         "parent_id": blk.parent_id,
                         "repair": bool(repair),
+                        # Receiver-local metrics after delivery
+                        "height": m.blocks[blk.id].height,
+                        "weight": m.cum_block_weight.get(blk.id, None),
                     })
                 # Policy hook (only for the miner that received)
                 act = getattr(m, "act", None)

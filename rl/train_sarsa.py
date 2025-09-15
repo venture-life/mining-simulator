@@ -124,7 +124,7 @@ def main() -> None:
 
         policy.start_episode()
         R = 0.0
-        sample_runs = 2
+        sample_runs = 3
         for i in range(sample_runs):
             res = simulate_mining_eventqV2(
                 steps=int(args.steps),

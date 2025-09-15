@@ -49,12 +49,10 @@ class Discretizer:
                  lead_clip: int = 5,
                  diffw_bins: Sequence[int] = (-5,-4,-3,-2, -1, 0, 1, 2,3,4,5),
                  mu_edges: Sequence[float] = (0.06, 0.10),
-                 pub_clip: int = 5,
                  withheld_cap: int = 8) -> None:
         self.lead_clip = int(lead_clip)
         self.diffw_bins = tuple(diffw_bins)
         self.mu_edges = tuple(mu_edges)
-        self.pub_clip = int(pub_clip)
         self.wc_cap = int(withheld_cap)
 
     def _bin_lead(self, lead: int) -> int:
@@ -108,9 +106,8 @@ class Discretizer:
         - lead_bin ∈ [-clip..clip]
         - diffw_bin (private-public) bounded by diffw_bins (default [-5..+5])
         - luck_bool ∈ {0,1} (when withholding and diff_w==0, FRP on cf selects attacker)
-        - last ∈ {h,s}
+        - last ∈ {s0,s1,h0,h1}
         - withheld_count_clip ∈ [0..withheld_cap] (cap independent of k)
-        - published_count_clip ∈ [0..pub_clip]
         - alpha_bucket ∈ {a0,a1,a2,a3,a4}
         - k_bucket ∈ {k2,k3,k4,k5p}
         - mu_bucket ∈ {mulo,mumi,muhi}
@@ -124,20 +121,18 @@ class Discretizer:
             lead = int(getattr(miner, "lead", lambda: 0)())
         diffw = int(getattr(miner, "diff_w", 0))
         luck = 1 if bool(getattr(miner, "luck", False)) else 0
-        last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+        last = str(getattr(miner, "last", 'h0'))
         withheld_count = len(getattr(miner, "_withheld", []) or [])
-        published = int(getattr(miner, "published", 0))
 
         lead_b = self._bin_lead(lead)
         diffw_b = self._bin_diffw(diffw)
         wc_b = min(int(withheld_count), int(self.wc_cap))
-        pub_b = min(max(0, int(published)), int(self.pub_clip))
         a_b = self._bucket_alpha(ctx.alpha)
         k_b = self._bucket_k(ctx.k)
         mu_b = self._bucket_mu(ctx.mu)
         mode_b = self._bucket_mode(ctx.mode_flag)
 
-        state_key = (lead_b, diffw_b, luck, last, wc_b, pub_b, a_b, k_b, mu_b, mode_b)
+        state_key = (lead_b, diffw_b, luck, last, wc_b, a_b, k_b, mu_b, mode_b)
         return state_key, int(ctx.k)
 
 
@@ -153,19 +148,16 @@ def allowed_actions(miner: Any, k: int, now: Optional[float] = None) -> List[int
 
     Parameter k is unused but kept for signature stability.
     """
-    wcnt = len(getattr(miner, "_withheld", []) or [])
-    if int(wcnt) <= 0:
-        # No secret chain: only adopt is meaningful (and will be a no-op in SelfishMiner when wc==0)
-        return [-1]
 
-    # Withholding: allow hide and publish-one by default
-    acts: List[int] = [0, 1]
-
-    # Consider adopt unless it would immediately discard a fresh selfish-mined block
-    last_event = str(getattr(miner, "_last_event", ""))
-    last_sym = 's' if getattr(miner, "last", 'h') == 's' else 'h'
-    if not (last_sym == 's' and last_event == "mine"):
+    last_sym = str(getattr(miner, "last", 'h0'))
+    withheld_count = len(getattr(miner, "_withheld", []) or [])
+    # lead = int(getattr(miner, "lead", lambda: 0)())
+    acts: List[int] = [0]
+    if withheld_count > 0 and not (withheld_count == 1 and last_sym == 's0'):
+        acts.append(1)
+    if not (last_sym == 's0' or last_sym == 's1'):
         acts.append(-1)
+
     return acts
 
 
@@ -321,10 +313,11 @@ class BootstrappedPolicy:
     def __call__(self, miner: Any, now: float) -> Any:
         s_key, k_cap = self.disc.discretize(miner, self.ctx)
         mask = allowed_actions(miner, k_cap, now=now)
-        # Baseline preference: if last=='h' → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
-        last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+        # Baseline preference: if last is honest (h0/h1) → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
+        last_raw = str(getattr(miner, "last", "h0"))
+        last_is_honest = last_raw.startswith('h')
         preferred: Optional[int] = None
-        if last == 'h':
+        if last_is_honest:
             preferred = -1
         else:
             preferred = 1 if (1 in mask) else 0
@@ -366,18 +359,18 @@ class BootstrappedPolicy:
             try:
                 # Pull a few raw features for readability
                 lead = int(getattr(miner, "lead", lambda: 0)())
+                diff_w = int(getattr(miner, "diff_w", 0))
                 luck = int(bool(getattr(miner, "luck", False)))
-                last_sym = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+                last_sym = str(getattr(miner, "last", "h0"))
                 wcnt = int(len(getattr(miner, "_withheld", []) or []))
-                pubd = int(getattr(miner, "published", 0))
                 entry = {
                     "t": float(now),
                     "state_key": s_key,
                     "lead": lead,
+                    "diffw": diff_w,
                     "luck": luck,
                     "last": last_sym,
                     "withheld": wcnt,
-                    "published": pubd,
                     "mask": list(mask),
                     "preferred": int(preferred) if preferred is not None else None,
                     "q": q_vals,
@@ -439,10 +432,11 @@ def policy_callback_factory(learner: SarsaLambda,
         try:
             s_key, k_cap = disc.discretize(miner, ctx)
             mask = allowed_actions(miner, k_cap, now=now)
-            # Baseline preference: if last=='h' → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
-            last = 's' if getattr(miner, "last", 'h') == 's' else 'h'
+            # Baseline preference: if last is honest (h0/h1) → adopt (-1); if last=='s' → publish (1) if allowed else hide (0)
+            last_raw = str(getattr(miner, "last", "h0"))
+            last_is_honest = last_raw.startswith('h')
             preferred: Optional[int] = None
-            if last == 'h':
+            if last_is_honest:
                 preferred = -1
             else:
                 preferred = 1 if (1 in mask) else 0

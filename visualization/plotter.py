@@ -85,6 +85,11 @@ def plot_local_chains_eventq_v2(
             bid = str(ev.get("block_id"))
             if bid not in parent:
                 parent[bid] = ev.get("parent_id")
+            # Include receiver-local metrics when available (added in simulator trace)
+            if "height" in ev:
+                height_map[bid] = ev.get("height")
+            if "weight" in ev:
+                weight_map[bid] = ev.get("weight")
         elif ev["type"] == "PUBLISH":
             # Selfish miner publication (no direct MINE trace); treat like MINE for origin metadata
             bid = str(ev.get("block_id"))
