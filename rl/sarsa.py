@@ -114,11 +114,7 @@ class Discretizer:
         - mode_flag_bucket ∈ {m0,m1}
         """
         # Pull dynamic fields from SelfishMiner
-        try:
-            lead = int(miner.lead())
-        except Exception as e:
-            logging.exception("Discretizer: miner.lead() failed; using fallback lead() attr")
-            lead = int(getattr(miner, "lead", lambda: 0)())
+        lead = int(getattr(miner, "lead",  0))
         diffw = int(getattr(miner, "diff_w", 0))
         luck = 1 if bool(getattr(miner, "luck", False)) else 0
         last = str(getattr(miner, "last", 'h0'))
@@ -153,7 +149,7 @@ def allowed_actions(miner: Any, k: int, now: Optional[float] = None) -> List[int
     withheld_count = len(getattr(miner, "_withheld", []) or [])
     # lead = int(getattr(miner, "lead", lambda: 0)())
     acts: List[int] = [0]
-    if withheld_count > 0 and not (withheld_count == 1 and last_sym == 's0'):
+    if withheld_count > 0: # and not (withheld_count == 1 and last_sym == 's0'):
         acts.append(1)
     if not (last_sym == 's0' or last_sym == 's1'):
         acts.append(-1)
@@ -358,7 +354,7 @@ class BootstrappedPolicy:
         if self.debug:
             try:
                 # Pull a few raw features for readability
-                lead = int(getattr(miner, "lead", lambda: 0)())
+                lead = int(getattr(miner, "lead", 0)())
                 diff_w = int(getattr(miner, "diff_w", 0))
                 luck = int(bool(getattr(miner, "luck", False)))
                 last_sym = str(getattr(miner, "last", "h0"))

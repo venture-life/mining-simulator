@@ -33,7 +33,8 @@ def simulate_mining_eventqV2(
     trace_limit: Optional[int] = None,
     attacker_share: Optional[float] = None,
     selfish_policy: Optional[Callable[["SelfishMiner", float], Any]] = None,
-    burnout_window: int = 2,
+    burnout_window: int = 3, # end of simulation, steps - burnout_window: Aggressively publish all withheld and behave honestly
+    attacker_connectivity_edge: float = 250.0, # eg, 250x faster propagation
 ) -> HonestEventqResult:
     """
     Continuous-time simulation with a single global Poisson process of block arrivals (rate Λ).
@@ -143,11 +144,11 @@ def simulate_mining_eventqV2(
 
     # Network delay sampling (right-skew) and parent-repair parameters
     # - sample_delay(connectivity_boost): lognormal with mean ~= eff_max/2, capped at eff_max
-    #   where eff_max = max_prop_delay normally, and eff_max = max_prop_delay/250 when
+    #   where eff_max = max_prop_delay normally, and eff_max = max_prop_delay/attacker_connectivity_edge when
     #   connectivity_boost=True (e.g., when an attacker endpoint is involved).
     # - T_REQ: small request/response overhead per missing ancestor during repair
     def sample_delay(connectivity_boost: bool = False) -> float:
-        eff_max = max_prop_delay / 250 if connectivity_boost else max_prop_delay
+        eff_max = max_prop_delay / attacker_connectivity_edge if connectivity_boost else max_prop_delay
         if eff_max <= 0.0:
             return 0.0
         sigma = 0.6  # right-skew
