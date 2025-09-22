@@ -37,7 +37,8 @@ class Miner:
     Fork resolution (evaluated on known heads):
     1) If one chain is longer than all others by at least k blocks, mine on the
        longest chain.
-    2) Otherwise choose the chain with the largest weight.
+    2) Otherwise, restrict to heads within (k−1) of the TOP HEIGHT and choose the
+       chain with the largest weight among those.
     3) If multiple chains share the largest weight:
        - If deterministic_selection=True (default), choose deterministically by
          hashing the sorted candidate ids (BLAKE2b) and selecting index = H % len(candidates).
@@ -58,7 +59,8 @@ class Miner:
 
     def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None) -> None:
         self.miner_id = miner_id
-        self.k = int(k)
+        # Sanity check: enforce k >= 1 (k=0 behaves like k=1 for 'strictly dominant longest')
+        self.k = max(1, int(k))
         self.tau = float(tau)
         self.deterministic_selection: bool = bool(deterministic_selection)
         self.tie_break_seed: Optional[int] = (int(tie_break_seed) if tie_break_seed is not None else None)
@@ -245,15 +247,9 @@ class Miner:
         if top_ids:
             if len(top_ids) == 1:
                 # Check if any competitor leaf exists in the window [max_h-(k-1), max_h-1]
-                competitor_nearby = False
-                if self.k > 0:
-                    start_h = max(0, max_h - (self.k - 1))
-                    for h in range(start_h, max_h):
-                        if self.leaves_by_height.get(h):
-                            competitor_nearby = True
-                            break
-                # If k == 0, Rule 1 cannot establish a unique dominance; fall through.
-                if self.k > 0 and not competitor_nearby:
+                start_h = max(0, max_h - (self.k - 1))
+                competitor_nearby = any(self.leaves_by_height.get(h) for h in range(start_h, max_h))
+                if not competitor_nearby:
                     return self.blocks[next(iter(top_ids))]
 
         heads = self._current_heads()
@@ -270,9 +266,12 @@ class Miner:
         if max_h - second_h >= self.k:
             return longest
 
-        # Rule 2: choose by maximal cumulative chain weight
-        max_w = max(self.cum_block_weight.get(b.id, 0) for b in heads)
-        best = [b for b in heads if self.cum_block_weight.get(b.id, 0) == max_w]
+        # Restrict candidates to heads within (k-1) of the top height when Rule 1 cannot resolve
+        start_h = max(0, max_h - (self.k - 1))
+        eligible = [b for b in heads if b.height >= start_h]
+        # Rule 2: choose by maximal cumulative chain weight among eligible candidates
+        max_w = max(self.cum_block_weight.get(b.id, 0) for b in eligible)
+        best = [b for b in eligible if self.cum_block_weight.get(b.id, 0) == max_w]
         if len(best) == 1:
             return best[0]
 

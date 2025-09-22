@@ -126,7 +126,7 @@ def main() -> None:
 
         policy.start_episode()
         R = 0.0
-        sample_runs = 3
+        sample_runs = 1
         for i in range(sample_runs):
             res = simulate_mining_eventqV2(
                 steps=int(args.steps),
@@ -137,7 +137,8 @@ def main() -> None:
                 deterministic_selection=(not args.random_tie_break),
                 seed=(None if ep_seed is None else int(ep_seed + i )),
                 attacker_share=float(args.attacker_share),
-                selfish_policy=policy,
+                # REMEMBER TO ENABLE AGAIN. TEMPORARY COMMENTED OUT. TRAIN_SARSA IS (AB)USED AS SWEEP TOOL WITH --EVAL-ONLY AND directly implemented strategy in selfish_miner.py
+                # selfish_policy=policy,
             )
             d: Dict[str, Any] = res.to_dict()
             if args.baseline_advantage:

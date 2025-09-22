@@ -33,7 +33,7 @@ def simulate_mining_eventqV2(
     trace_limit: Optional[int] = None,
     attacker_share: Optional[float] = None,
     selfish_policy: Optional[Callable[["SelfishMiner", float], Any]] = None,
-    burnout_window: int = 5,
+    burnout_window: int = 2,
 ) -> HonestEventqResult:
     """
     Continuous-time simulation with a single global Poisson process of block arrivals (rate Λ).
@@ -155,9 +155,9 @@ def simulate_mining_eventqV2(
         d = float(rng.lognormal(mean=mu, sigma=sigma))
         return d if d <= eff_max else eff_max
 
-    T_REQ = 0.00  # shit is not needed
+    T_REQ = 0.0001
     # Small local time offset between successive publishes in the same event
-    EPSILON_LOCAL_PUBLISH = 0.000  # 0.1 ms
+    EPSILON_LOCAL_PUBLISH = 0.0001  # 0.1 ms
 
     # Global block store to enable ancestor fetch during parent repair
     block_store: Dict[str, Block] = {}

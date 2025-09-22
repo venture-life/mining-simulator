@@ -35,7 +35,8 @@ class SelfishMiner:
 
     def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
         self.miner_id = int(miner_id)
-        self.k = int(k)
+        # Sanity check: enforce k >= 1 (k=0 behaves like k=1 for 'strictly dominant longest')
+        self.k = max(1, int(k))
         self.tau = float(tau)
         # Propagate tie-break style to internal honest miners
         self.deterministic_selection: bool = bool(deterministic_selection)
@@ -68,6 +69,11 @@ class SelfishMiner:
         self.luck: bool = False
         self.last: str = 'h0'
         self.published: int = 0
+        self.lead = 0
+        # Burn-out mode: when enabled, transition towards honest behavior near cutoff.
+        # - act(): aggressively publishes withheld blocks until empty, then adopts public.
+        # - on_mine(): in burnout, mine on PUBLIC head and immediately publish (return Block).
+        self.burnout: bool = False
 
         # Initialize metrics
         self._recompute_state()
@@ -103,6 +109,13 @@ class SelfishMiner:
         # to be explored some day
         # self.prefer_second_last_on_hide: bool = False
 
+    def get_lead(self) -> int:
+        """Return private_head_height - public_head_height."""
+        pub_head = self.public.blocks[self.public.selected_head_id]
+        prv_head = self.private.blocks[self.private.selected_head_id]
+
+        return int(prv_head.height) - int(pub_head.height)        
+
     # ------------------------- public API (mirror) -------------------------
     def on_receive(self, block: Block, received_time: float) -> None:
         """
@@ -110,6 +123,11 @@ class SelfishMiner:
         We must clone the incoming block to avoid cross-view mutation of fields
         like height during connection.
         """
+
+        # Fast path: duplicate delivery → keep earliest first-seen and return
+        if block.id in self.public.blocks:
+            return
+
         # Always clone for PUBLIC deliver to avoid cross-view mutation
         pb_pub = self._clone_block(block)
         self.public.on_receive(pb_pub, received_time)
@@ -117,12 +135,18 @@ class SelfishMiner:
         self._last_event = "receive"
         self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
         if self._last_receive_from_competitor:
+            # only log lead if it was a new block, ie. not one we published ourselfs... that would be doublecounting lead, since it's already in on_mine
+            self.lead = self.get_lead()
             if self.public.blocks[block.parent_id].miner_id == self.miner_id:
+                # extends us
                 self.last = 'h1'
             else:
+                # extends rando
                 self.last = 'h0'
         else:
             self.last = 's1'
+
+
 
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
@@ -137,10 +161,41 @@ class SelfishMiner:
         after which the policy is consulted again on the new state to decide
         whether to publish another withheld block.
         """
+        # If in burn-out mode, switch to honest-like behavior: mine on PUBLIC head and publish immediately.
+        if self.burnout:
+            # Select parent from PUBLIC view
+            parent_pub = self.public._select_head()
+            new_id = f"{self.miner_id}:{self._next_seq}"
+            self._next_seq += 1
+            # Determine uncles from PUBLIC siblings of the chosen parent
+            uncles_pub: List[str] = []
+            if parent_pub.parent_id is not None:
+                gp = parent_pub.parent_id
+                for sib_id in self.public.children.get(gp, []):
+                    if sib_id == parent_pub.id:
+                        continue
+                    if sib_id in self.public.in_time_blocks:
+                        uncles_pub.append(sib_id)
+            new_block_pub = Block(
+                id=new_id,
+                parent_id=parent_pub.id,
+                miner_id=self.miner_id,
+                height=parent_pub.height + 1,
+                uncles=uncles_pub,
+                created_time=now,
+            )
+            # Do not mutate local state here; simulator will broadcast and then deliver (including to self)
+            self._last_event = "mine"
+            self.last = 's0'
+            # lead will be recomputed on delivery
+            self._local_event_id += 1
+            return new_block_pub
+
         # Choose parent:
         # - Default: use the PRIVATE view's head per fork rules.
         # - Special case (Rule 3 tie and non-deterministic selection):
         #     prefer a head mined by us; else prefer a head whose parent was mined by us; else uniform random.
+        
         parent = None
         if not self.deterministic_selection:
             try:
@@ -158,9 +213,12 @@ class SelfishMiner:
                     if max_h - second_h >= self.k:
                         parent = longest
                     else:
-                        # Rule 2: maximal cumulative chain weight
-                        max_w = max(self.private.cum_block_weight.get(b.id, 0) for b in heads)
-                        best = [b for b in heads if self.private.cum_block_weight.get(b.id, 0) == max_w]
+                        # Restrict candidates to heads within (k-1) of the top height when Rule 1 cannot resolve
+                        start_h = max(0, max_h - (self.k - 1))
+                        eligible = [b for b in heads if b.height >= start_h]
+                        # Rule 2: maximal cumulative chain weight among eligible candidates
+                        max_w = max(self.private.cum_block_weight.get(b.id, 0) for b in eligible)
+                        best = [b for b in eligible if self.private.cum_block_weight.get(b.id, 0) == max_w]
                         if len(best) > 1:
                             # Rule 3 tie: apply biased tie-break
                             mine_heads = [b for b in best if b.miner_id == self.miner_id]
@@ -211,6 +269,8 @@ class SelfishMiner:
         self._withheld.append(new_block)
         self._last_event = "mine"
         self.last = 's0'
+        self.lead = self.get_lead()
+
         # Increment local event counter (idempotence key)
         self._local_event_id += 1
         return None
@@ -253,13 +313,7 @@ class SelfishMiner:
     def block_first_seen(self) -> Dict[str, float]:
         return self.public.block_first_seen
 
-    # ------------------------- utilities for strategies --------------------
-    def lead(self) -> int:
-        """Return private_head_height - public_head_height."""
-        pub_head = self.public.blocks[self.public.selected_head_id]
-        prv_head = self.private.blocks[self.private.selected_head_id]
 
-        return int(prv_head.height) - int(pub_head.height)
 
     # ------------------------- metrics and state ---------------------------
     def _recompute_state(self, *, now: Optional[float] = None) -> None:
@@ -368,15 +422,55 @@ class SelfishMiner:
         """
 
         # Recompute policy-relevant metrics at the current decision time
-        self._recompute_state(now=now)
+        # self._recompute_state(now=now)
+
 
         # Call decider with the unified interface (miner, now) -> int
         try:
-            decision = int(self._decide_fn(self, now))  # type: ignore[misc]
+            # decision = int(self._decide_fn(self, now))  # type: ignore[misc]
+            # Burn-out mode: aggressively drain withheld, then align to public.
+            if self.burnout:
+                if self._withheld:
+                    decision = 1
+                else:
+                    decision = -1
+            elif self.last == "s0" or self.last == "s1":
+                if self.lead == 1 and self.last == "s1":
+                    if self._withheld:
+                        decision = 1
+                    else:
+                        decision = 0
+                else:
+                    decision = 0
+            else: # others find a block
+                if self.lead < 0:
+                    decision = -1
+                # elif self.lead == 0:
+                #     # publish one, it will trigger s1 with lead = 0 (line 443)
+                #     decision = 1
+                # elif self.lead == 1:
+                #     # publish all, it will trigger s1 with lead = 1 (line 438)
+                #     decision = 1
+
+                else: # self.lead >= 2
+                    # publish one, it will trigger s1 with lead >= 2 (line 443)
+                    decision = 1
+                # Longer re-orgs: Only feasible if pure PoW, no PoP (ie, k = 1, D=0 (effectively first-seen))
+                # elif self.lead < 2:
+                #     decision = 1
+                # else:
+                #     decision = 0
+
+
+
+
+
+
         except Exception as e:
             logger.exception("Policy decider raised; defaulting decision=0")
             decision = 0
 
+        self.lead = self.get_lead()
         if decision < 0:
             self._adopt_public()
             return None
@@ -400,6 +494,7 @@ class SelfishMiner:
         self._withheld.clear()
         # Reset published counter to reflect "since adopt" semantics
         self.published = 0
+        self.lead = self.get_lead()
 
 
 
