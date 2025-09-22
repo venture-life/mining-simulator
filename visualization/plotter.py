@@ -72,31 +72,36 @@ def plot_local_chains_eventq_v2(
     # Collect block metadata: origin miner and parent id
     origin: Dict[str, int] = {}
     parent: Dict[str, Optional[str]] = {}
-    height_map: Dict[str, Optional[int]] = {}
-    weight_map: Dict[str, Optional[float]] = {}
+    # Lane-specific height/weight maps: miner -> (block_id -> value)
+    height_map: Dict[int, Dict[str, Optional[int]]] = {}
+    weight_map: Dict[int, Dict[str, Optional[float]]] = {}
     for ev in trace:
         if ev["type"] == "MINE":
             bid = str(ev.get("block_id"))
-            origin[bid] = int(ev.get("miner"))
+            m = int(ev.get("miner"))
+            origin[bid] = m
             parent[bid] = ev.get("parent_id")
-            height_map[bid] = ev.get("height")
-            weight_map[bid] = ev.get("weight")
+            height_map.setdefault(m, {})[bid] = ev.get("height")
+            weight_map.setdefault(m, {})[bid] = ev.get("weight")
         elif ev["type"] == "DELIVER":
             bid = str(ev.get("block_id"))
             if bid not in parent:
                 parent[bid] = ev.get("parent_id")
             # Include receiver-local metrics when available (added in simulator trace)
-            if "height" in ev:
-                height_map[bid] = ev.get("height")
-            if "weight" in ev:
-                weight_map[bid] = ev.get("weight")
+            to_m = int(ev.get("to")) if ev.get("to") is not None else None
+            if to_m is not None:
+                if "height" in ev:
+                    height_map.setdefault(to_m, {})[bid] = ev.get("height")
+                if "weight" in ev:
+                    weight_map.setdefault(to_m, {})[bid] = ev.get("weight")
         elif ev["type"] == "PUBLISH":
             # Selfish miner publication (no direct MINE trace); treat like MINE for origin metadata
             bid = str(ev.get("block_id"))
-            origin[bid] = int(ev.get("miner"))
+            m = int(ev.get("miner"))
+            origin[bid] = m
             parent[bid] = ev.get("parent_id")
-            height_map[bid] = ev.get("height")
-            weight_map[bid] = ev.get("weight")
+            height_map.setdefault(m, {})[bid] = ev.get("height")
+            weight_map.setdefault(m, {})[bid] = ev.get("weight")
 
     # Build first-seen times per miner for each block
     seen_time: Dict[int, Dict[str, float]] = {m: {} for m in range(groups)}
@@ -195,8 +200,8 @@ def plot_local_chains_eventq_v2(
             track_tip_block[m] = {}
         for slot_idx, t in enumerate(ordered_ts):
             bids = list(by_t_per_miner[m][t])
-            # Stable order for drawing: by height then origin then id
-            bids.sort(key=lambda b: ((height_map.get(b) if height_map.get(b) is not None else -1), origin.get(b, 0), b))
+            # Stable order for drawing: by (lane-local) height then origin then id
+            bids.sort(key=lambda b: ((height_map.get(m, {}).get(b) if height_map.get(m, {}).get(b) is not None else -1), origin.get(b, 0), b))
 
             # Expire stale active tracks
             if track_persistence_slots is not None and track_persistence_slots >= 0:
@@ -342,14 +347,14 @@ def plot_local_chains_eventq_v2(
                 ax.add_patch(rect)
                 cx = slot_left + 0.5 * width
                 if annotate_ihw:
-                    h = height_map.get(bid)
-                    wv = weight_map.get(bid)
+                    h = height_map.get(m, {}).get(bid)
+                    wv = weight_map.get(m, {}).get(bid)
                     wtxt = "?" if wv is None else (f"{float(wv):.1f}" if isinstance(wv, (int, float)) else str(wv))
                     txt = f"{bid}\n{h}\n{wtxt}"
                     ax.text(cx, cy, txt, ha="center", va="center", fontsize=5.8, color="#000000", zorder=11)
                 elif annotate_hw:
-                    h = height_map.get(bid)
-                    wv = weight_map.get(bid)
+                    h = height_map.get(m, {}).get(bid)
+                    wv = weight_map.get(m, {}).get(bid)
                     wtxt = "?" if wv is None else (f"{float(wv):.1f}" if isinstance(wv, (int, float)) else str(wv))
                     txt = f"{h}\n{wtxt}"
                     ax.text(cx, cy, txt, ha="center", va="center", fontsize=6.0, color="#000000", zorder=11)

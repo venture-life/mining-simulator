@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trace-cap", type=int, default=50000, help="Maximum number of trace entries to keep in memory when --trace-policy is set")
     p.add_argument("--trace-out", type=str, default=None, help="Path to write per-episode traces as JSON. If contains {ep}, one file per episode; otherwise append JSON lines per episode.")
     p.add_argument("--trace-summary", action="store_true", help="Print a concise per-episode action summary to stdout when tracing is enabled")
+    # Tie-break behavior for Rule 3 in Miner
+    p.add_argument("--random-tie-break", action="store_true", help="Use uniform random tie-breaking among equal-weight heads (default: deterministic hash-based)")
     return p.parse_args()
 
 
@@ -132,7 +134,8 @@ def main() -> None:
                 Lambda=float(args.rate),
                 D=float(args.D),
                 k=int(args.k),
-                seed=(None if ep_seed is None else int(ep_seed + i + 1)),
+                deterministic_selection=(not args.random_tie_break),
+                seed=(None if ep_seed is None else int(ep_seed + i )),
                 attacker_share=float(args.attacker_share),
                 selfish_policy=policy,
             )

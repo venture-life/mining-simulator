@@ -33,14 +33,17 @@ class SelfishMiner:
       tight loop inside a single simulator event).
     """
 
-    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
+    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
         self.miner_id = int(miner_id)
         self.k = int(k)
         self.tau = float(tau)
+        # Propagate tie-break style to internal honest miners
+        self.deterministic_selection: bool = bool(deterministic_selection)
+        self.tie_break_seed: Optional[int] = (int(tie_break_seed) if tie_break_seed is not None else None)
 
         # Internal honest miners for the two views
-        self.public = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id)
-        self.private = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id)
+        self.public = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id, deterministic_selection=self.deterministic_selection, tie_break_seed=self.tie_break_seed)
+        self.private = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id, deterministic_selection=self.deterministic_selection, tie_break_seed=self.tie_break_seed)
 
         # Local sequence for ids when crafting blocks directly (if needed later)
         self._next_seq = 0
@@ -135,13 +138,51 @@ class SelfishMiner:
         whether to publish another withheld block.
         """
         # Choose parent:
-        # - If withholding, extend the private withheld tip to keep the secret chain contiguous.
-        # - Otherwise, choose parent based on ownership of the selected head or its parent.
-        # if self._withheld:
-        #     parent = self._withheld[-1]
-        # else:
+        # - Default: use the PRIVATE view's head per fork rules.
+        # - Special case (Rule 3 tie and non-deterministic selection):
+        #     prefer a head mined by us; else prefer a head whose parent was mined by us; else uniform random.
+        parent = None
+        if not self.deterministic_selection:
+            try:
+                heads = self.private._current_heads()
+            except Exception:
+                heads = []
+            if heads:
+                # Rule 1: longest chain by >= k blocks (strict dominance)
+                max_h = max(b.height for b in heads)
+                longest = max(heads, key=lambda b: b.height)
+                if len(heads) == 1:
+                    parent = longest
+                else:
+                    second_h = max((b.height for b in heads if b is not longest), default=longest.height)
+                    if max_h - second_h >= self.k:
+                        parent = longest
+                    else:
+                        # Rule 2: maximal cumulative chain weight
+                        max_w = max(self.private.cum_block_weight.get(b.id, 0) for b in heads)
+                        best = [b for b in heads if self.private.cum_block_weight.get(b.id, 0) == max_w]
+                        if len(best) > 1:
+                            # Rule 3 tie: apply biased tie-break
+                            mine_heads = [b for b in best if b.miner_id == self.miner_id]
+                            if mine_heads:
+                                parent = self.private._rng.choice(mine_heads)
+                            else:
+                                parent_mine_heads = []
+                                for b in best:
+                                    pid = b.parent_id
+                                    if pid is not None:
+                                        pb = self.private.blocks.get(pid)
+                                        if pb is not None and pb.miner_id == self.miner_id:
+                                            parent_mine_heads.append(b)
+                                if parent_mine_heads:
+                                    parent = self.private._rng.choice(parent_mine_heads)
+                                else:
+                                    parent = self.private._rng.choice(best)
+                        elif best:
+                            parent = best[0]
 
-        parent = self.private._select_head()
+        if parent is None:
+            parent = self.private._select_head()
 
         new_id = f"{self.miner_id}:{self._next_seq}"
         self._next_seq += 1
@@ -226,22 +267,25 @@ class SelfishMiner:
 
         Diff_w = Wh - Ws; last and published kept incrementally.
         """
-        # Use IDs for weight lookups
-        pub_head_id = self.public.selected_head_id
         self.luck = False
-        cf = None  # type: Optional[Miner]
-        # Compute Ws as counterfactual "if we published now" when time is provided and we are withholding
-        if now is not None and self._withheld:
-            prv_head_id = self._withheld[-1].id
-            cf = self._build_counterfactual_public(float(now),only_first = False)
-            Ws = int(cf.cum_block_weight.get(prv_head_id, 0))
+
+        # Use IDs for weight lookups
+        if (self.k <= 1 or self.tau <= 0.0) and not self.deterministic_selection:
+            self.diff_w = 0
         else:
-            prv_head_id = self.private.selected_head_id
-            Ws = int(self.private.cum_block_weight.get(prv_head_id, 0))
+            pub_head_id = self.public.selected_head_id
+            cf = None  # type: Optional[Miner]
+            # Compute Ws as counterfactual "if we published now" when time is provided and we are withholding
+            if now is not None and self._withheld:
+                prv_head_id = self._withheld[-1].id
+                cf = self._build_counterfactual_public(float(now),only_first = False)
+                Ws = int(cf.cum_block_weight.get(prv_head_id, 0))
+            else:
+                prv_head_id = self.private.selected_head_id
+                Ws = int(self.private.cum_block_weight.get(prv_head_id, 0))
 
-        Wh = int(self.public.cum_block_weight.get(pub_head_id, 0))
-        self.diff_w = Wh - Ws
-
+            Wh = int(self.public.cum_block_weight.get(pub_head_id, 0))
+            self.diff_w = Wh - Ws
 
 
     def _build_counterfactual_public(self, now: float, *, only_first: bool = False) -> Miner:
@@ -302,7 +346,7 @@ class SelfishMiner:
                 if wb.id in delivered_ids:
                     continue
                 cf.on_receive(self._clone_block(wb), received_time=t_cur)
-                if wb.id == self._withheld[0].id:
+                if self.deterministic_selection and wb.id == self._withheld[0].id:
                     selected = cf._select_head()
                     if selected is not None and selected.miner_id is not None:
                         self.luck = (int(selected.miner_id) == self.miner_id)
@@ -365,7 +409,14 @@ class SelfishMiner:
 
         Semantics-preserving: copies all local views without recomputation by replay.
         """
-        dst = Miner(miner_id=src.miner_id, k=src.k, tau=src.tau, genesis_id="GENESIS")
+        dst = Miner(
+            miner_id=src.miner_id,
+            k=src.k,
+            tau=src.tau,
+            genesis_id="GENESIS",
+            deterministic_selection=getattr(src, 'deterministic_selection', True),
+            tie_break_seed=getattr(src, 'tie_break_seed', None),
+        )
         # Clone blocks (dataclass) by value
         dst.blocks = {}
         for bid, b in src.blocks.items():
@@ -392,6 +443,12 @@ class SelfishMiner:
         dst.cum_block_weight = dict(src.cum_block_weight)
         # Preserve selected head
         dst.selected_head_id = src.selected_head_id
+        # Preserve RNG state for random tie-breaking so CF matches continuation
+        try:
+            if hasattr(src, '_rng') and hasattr(dst, '_rng'):
+                dst._rng.setstate(src._rng.getstate())
+        except Exception:
+            pass
         return dst
 
 

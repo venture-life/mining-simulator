@@ -26,6 +26,12 @@ def main() -> None:
     p_mine_v2.add_argument("--timing-verbose", action="store_true", help="Print full timing/streaks diagnostics; default prints compact sanity summary only")
     p_mine_v2.add_argument("--attacker-share", type=float, default=None, help="Attacker (selfish miner) share α in (0,1); if set, adds one attacker miner. Honest shares are rescaled to sum to (1-α): use provided --shares as relative weights, else uniform (1-α)/groups.")
     p_mine_v2.add_argument("--policy", type=str, default=None, help="Path to Q-table JSON for selfish miner policy (eval-only). Requires --attacker-share.")
+    # Tie-break behavior for Rule 3
+    p_mine_v2.add_argument(
+        "--random-tie-break",
+        action="store_true",
+        help="Use uniform random tie-breaking among equal-weight heads (default: deterministic hash-based)",
+    )
     # Total hashrate interpretation and concurrency control
     p_mine_v2.add_argument(
         "--total-hashrate-mode",
@@ -71,15 +77,15 @@ def main() -> None:
         D0 = float(args.window)
         mode = getattr(args, "total_hashrate_mode", "fixed_total")
         a = args.attacker_share
-        f = 1.0
+        f_factor = 1.0
         if mode == "additive_attacker" and a is not None:
             # Attacker joins on top of a fixed honest baseline (pre-difficulty adjustment)
             # Honest shares are still rescaled to (1-α) for thinning, but we scale Λ by f = 1/(1-α)
             # so that honest miners' absolute rates remain unchanged while total frequency increases.
             if not (0.0 < float(a) < 1.0):
                 raise SystemExit("--attacker-share must be in (0,1) when using additive_attacker mode")
-            f = 1.0 / (1.0 - float(a))
-        Lambda_eff = lambda0 * f
+            f_factor = 1.0 / (1.0 - float(a))
+        Lambda_eff = lambda0 * f_factor
         D_eff = D0  # Physical mode only: keep D fixed; concurrency μ varies with Λ
         MPD_eff = float(args.max_prop_delay)
 
@@ -122,6 +128,7 @@ def main() -> None:
             D=D_eff,
             max_prop_delay=MPD_eff,
             k=args.k,
+            deterministic_selection=(not args.random_tie_break),
             seed=args.seed,
             track_times=args.track_times,
             time_bins=args.time_bins,
@@ -158,7 +165,7 @@ def main() -> None:
         out = {k: d[k] for k in keys if k in d}
         # Add scenario metadata
         out["total_hashrate_mode"] = mode
-        out["hashrate_factor"] = f
+        out["hashrate_factor"] = f_factor
         out["mu"] = float(out.get("Lambda", Lambda_eff)) * float(out.get("D", D_eff))
         if getattr(args, "track_times", False) and d.get("timing") is not None:
             if getattr(args, "timing_verbose", False):

@@ -25,6 +25,7 @@ def simulate_mining_eventqV2(
     D: float = 5.0,
     max_prop_delay: float = 2.5,
     k: int = 3,
+    deterministic_selection: bool = True,
     seed: Optional[int] = None,
     track_times: bool = False,
     time_bins: int = 50,
@@ -32,6 +33,7 @@ def simulate_mining_eventqV2(
     trace_limit: Optional[int] = None,
     attacker_share: Optional[float] = None,
     selfish_policy: Optional[Callable[["SelfishMiner", float], Any]] = None,
+    burnout_window: int = 5,
 ) -> HonestEventqResult:
     """
     Continuous-time simulation with a single global Poisson process of block arrivals (rate Λ).
@@ -58,6 +60,12 @@ def simulate_mining_eventqV2(
     The simulation stops when miner 0's canonical head reaches 'steps' beyond genesis. Summary
     metrics are computed from miner 0's local view. If track_times=True, we also compute first-rival
     timing histograms over [0, max_prop_delay] using 'time_bins' bins.
+
+    Burn-out transition:
+    - If attacker_share is set and burnout_window > 0, when miner 0's canonical height enters the
+      final `burnout_window` blocks before cutoff, the SelfishMiner switches to burn-out mode:
+        - Immediately starts publishing withheld blocks (one-by-one via act()), and adopts once empty.
+        - New mines from the attacker act honestly (mine on PUBLIC head and publish immediately).
     """
     if steps <= 0:
         raise ValueError("steps must be > 0")
@@ -83,7 +91,10 @@ def simulate_mining_eventqV2(
         if total_share <= 0.0:
             raise ValueError("sum(shares) must be > 0")
         shares = [float(s) / total_share for s in shares]
-        miners = [Miner(miner_id=i, k=k, tau=D) for i in range(groups)]
+        miners = []
+        for i in range(groups):
+            tb_seed = None if seed is None else int(seed) + int(i)
+            miners.append(Miner(miner_id=i, k=k, tau=D, deterministic_selection=deterministic_selection, tie_break_seed=tb_seed))
     else:
         a = float(attacker_share)
         if not (0.0 < a < 1.0):
@@ -107,7 +118,13 @@ def simulate_mining_eventqV2(
         # Append attacker as last index
         shares = honest_shares + [a]
         attacker_idx = groups  # attacker is last
-        miners = [Miner(miner_id=i, k=k, tau=D) for i in range(groups)] + [SelfishMiner(miner_id=attacker_idx, k=k, tau=D, alpha=a, policy=selfish_policy)]
+        miners = []
+        for i in range(groups):
+            tb_seed = None if seed is None else int(seed) + int(i)
+            miners.append(Miner(miner_id=i, k=k, tau=D, deterministic_selection=deterministic_selection, tie_break_seed=tb_seed))
+        # Attacker tie-break seed also derived from simulator seed + attacker index
+        atk_tb_seed = None if seed is None else int(seed) + int(attacker_idx)
+        miners.append(SelfishMiner(miner_id=attacker_idx, k=k, tau=D, deterministic_selection=deterministic_selection, tie_break_seed=atk_tb_seed, alpha=a, policy=selfish_policy))
 
     # max propagation delay is now an independent parameter (default 2.5s), not tied to D
     max_prop_delay = float(max_prop_delay)
@@ -147,9 +164,31 @@ def simulate_mining_eventqV2(
 
     # Optional event trace for visualization
     trace_events: List[Dict] = [] if trace else None  # type: ignore[assignment]
+    # De-duplication guard: concurrent parent-repair can cause repeated deliveries of the same block
+    # to the same miner via multiple repair paths. We suppress duplicate trace entries to keep
+    # visualization edges consistent.
+    _trace_seen: Dict[str, set] = {"DELIVER": set(), "MINE": set(), "PUBLISH": set()} if trace else {}  # type: ignore[assignment]
     def _trace_append(ev: Dict) -> None:
         if trace_events is not None:
-            # Enforce optional limit on trace length
+            ev_type = str(ev.get("type"))
+            # Compute a conservative uniqueness key per event type
+            key = None
+            if ev_type == "DELIVER":
+                # Uniqueness by (to, block_id); multiple repair-originated deliveries collapse
+                key = (ev.get("to"), ev.get("block_id"))
+            elif ev_type == "MINE":
+                # A block is mined once; use block_id for safety
+                key = (ev.get("block_id"),)
+            elif ev_type == "PUBLISH":
+                # Publications from selfish miner; typically unique by (block_id). Include time to be safe
+                key = (ev.get("block_id"), ev.get("t"))
+            # If we have a seen-set for this type, skip duplicates
+            if isinstance(_trace_seen, dict) and ev_type in _trace_seen and key is not None:
+                s = _trace_seen[ev_type]
+                if key in s:
+                    return
+                s.add(key)
+            # Enforce optional limit on trace length (after de-dup decision)
             if trace_limit is not None and len(trace_events) >= trace_limit:
                 return
             trace_events.append(ev)
@@ -196,6 +235,14 @@ def simulate_mining_eventqV2(
     mine_events = 0
     # Seed first global mining event
     _push_event(t + float(rng.exponential(1.0 / Lambda)), 1, None)
+
+    # Sanity for burnout_window
+    try:
+        burnout_window = int(burnout_window)
+    except Exception:
+        burnout_window = 0
+    if burnout_window < 0:
+        burnout_window = 0
 
     while events:
         t, kind, _, payload = heapq.heappop(events)
@@ -314,6 +361,27 @@ def simulate_mining_eventqV2(
                     except Exception:
                         # Keep simulator running even if a custom policy misbehaves
                         pass
+
+        # Burn-out trigger: when miner 0 approaches cutoff, switch attacker to burn-out and flush.
+        if attacker_idx is not None and burnout_window > 0:
+            try:
+                h0 = miners[0].blocks[miners[0].selected_head_id].height
+                if h0 >= max(0, steps - burnout_window):
+                    attacker = miners[attacker_idx]
+                    if isinstance(attacker, SelfishMiner) and not getattr(attacker, 'burnout', False):
+                        attacker.burnout = True
+                        # Immediately drain withheld chain at current time t for a realistic flood
+                        # of publications before cutoff. Each act publishes at most one.
+                        safety = 0
+                        while safety < 10000:
+                            safety += 1
+                            out = attacker.act(t)
+                            if isinstance(out, Block):
+                                _broadcast_block(out, attacker_idx, t)
+                            else:
+                                break
+            except Exception:
+                pass
 
         # Note: policy hooks are invoked only for the miner whose local state just changed
         # (via MINE or successful DELIVER). No global polling to avoid information leakage.

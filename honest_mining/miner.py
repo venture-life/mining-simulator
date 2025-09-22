@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Callable
 import hashlib
+import random
 
 
 @dataclass
@@ -37,8 +38,10 @@ class Miner:
     1) If one chain is longer than all others by at least k blocks, mine on the
        longest chain.
     2) Otherwise choose the chain with the largest weight.
-    3) If multiple chains share the largest weight, choose deterministically by
-       hashing the sorted candidate ids (BLAKE2b) and selecting index = H % len(candidates).
+    3) If multiple chains share the largest weight:
+       - If deterministic_selection=True (default), choose deterministically by
+         hashing the sorted candidate ids (BLAKE2b) and selecting index = H % len(candidates).
+       - Otherwise, choose uniformly at random among the tied heads.
 
     Definitions (evaluated from this miner's local perspective):
     - In-time block:
@@ -53,10 +56,14 @@ class Miner:
         embedded in the in-time blocks along that path.
     """
 
-    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS") -> None:
+    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None) -> None:
         self.miner_id = miner_id
         self.k = int(k)
         self.tau = float(tau)
+        self.deterministic_selection: bool = bool(deterministic_selection)
+        self.tie_break_seed: Optional[int] = (int(tie_break_seed) if tie_break_seed is not None else None)
+        # Per-miner RNG for random tie-breaking (seeded by simulator when provided)
+        self._rng = random.Random(self.tie_break_seed)
 
         # Local block tree
         self.blocks: Dict[str, Block] = {}
@@ -269,13 +276,22 @@ class Miner:
         if len(best) == 1:
             return best[0]
 
-        # Rule 3: deterministic random among ties
-        chosen_id = self._deterministic_choice([b.id for b in best])
-        return self.blocks[chosen_id]
+        # Rule 3: break ties deterministically or uniformly at random
+        if self.deterministic_selection:
+            chosen_id = self._deterministic_choice([b.id for b in best])
+            return self.blocks[chosen_id]
+        else:
+            return self._rng.choice(best)
 
     def _current_heads(self) -> List[Block]:
         """Return blocks that have no known children (leaves)."""
-        return [self.blocks[bid] for bid in self.leaves]
+        # IMPORTANT: iterate leaves in a deterministic order. Sets have hash-dependent
+        # iteration order which can vary between runs (PYTHONHASHSEED). If we build
+        # candidate head lists from an unordered set, then subsequent random tie-breaks
+        # (even with a fixed RNG seed) can select different blocks because the list
+        # permutation changes across processes. Sorting by id stabilizes the ordering
+        # and ensures reproducible outcomes for a given seed.
+        return [self.blocks[bid] for bid in sorted(self.leaves)]
 
 
     def _iter_path_from_head(self, head_id: str) -> List[Block]:
