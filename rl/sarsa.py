@@ -49,11 +49,13 @@ class Discretizer:
                  lead_clip: int = 5,
                  diffw_bins: Sequence[int] = (-5,-4,-3,-2, -1, 0, 1, 2,3,4,5),
                  mu_edges: Sequence[float] = (0.06, 0.10),
-                 withheld_cap: int = 8) -> None:
+                 withheld_cap:  int = 10,
+                 published_cap: int = 20) -> None:
         self.lead_clip = int(lead_clip)
         self.diffw_bins = tuple(diffw_bins)
         self.mu_edges = tuple(mu_edges)
         self.wc_cap = int(withheld_cap)
+        self.pub_cap = int(published_cap)
 
     def _bin_lead(self, lead: int) -> int:
         L = max(-self.lead_clip, min(self.lead_clip, int(lead)))
@@ -119,16 +121,18 @@ class Discretizer:
         luck = 1 if bool(getattr(miner, "luck", False)) else 0
         last = str(getattr(miner, "last", 'h0'))
         withheld_count = len(getattr(miner, "_withheld", []) or [])
+        published = int(getattr(miner,"published", 0))
 
         lead_b = self._bin_lead(lead)
         diffw_b = self._bin_diffw(diffw)
+        published_b = min(int(published),int(self.pub_cap))
         wc_b = min(int(withheld_count), int(self.wc_cap))
         a_b = self._bucket_alpha(ctx.alpha)
         k_b = self._bucket_k(ctx.k)
         mu_b = self._bucket_mu(ctx.mu)
         mode_b = self._bucket_mode(ctx.mode_flag)
 
-        state_key = (lead_b, diffw_b, luck, last, wc_b, a_b, k_b, mu_b, mode_b)
+        state_key = (lead_b, diffw_b, luck, last, wc_b, published_b, a_b, k_b, mu_b, mode_b)
         return state_key, int(ctx.k)
 
 
@@ -147,12 +151,16 @@ def allowed_actions(miner: Any, k: int, now: Optional[float] = None) -> List[int
 
     last_sym = str(getattr(miner, "last", 'h0'))
     withheld_count = len(getattr(miner, "_withheld", []) or [])
-    # lead = int(getattr(miner, "lead", lambda: 0)())
-    acts: List[int] = [0]
-    if withheld_count > 0: # and not (withheld_count == 1 and last_sym == 's0'):
+    published = int(getattr(miner, "published", 0))
+    lead = int(getattr(miner, "lead", 0))
+    
+    acts: List[int] = []
+    if withheld_count > 0 and not (last_sym == 's0' and published == 0):
         acts.append(1)
     if not (last_sym == 's0' or last_sym == 's1'):
         acts.append(-1)
+    if not (withheld_count == 0 and last_sym == 'h1') and not (withheld_count > 0 and published > 0 and lead == 1):
+        acts.append(0)
 
     return acts
 
@@ -354,7 +362,7 @@ class BootstrappedPolicy:
         if self.debug:
             try:
                 # Pull a few raw features for readability
-                lead = int(getattr(miner, "lead", 0)())
+                lead = int(getattr(miner, "lead", 0))
                 diff_w = int(getattr(miner, "diff_w", 0))
                 luck = int(bool(getattr(miner, "luck", False)))
                 last_sym = str(getattr(miner, "last", "h0"))
@@ -367,6 +375,7 @@ class BootstrappedPolicy:
                     "luck": luck,
                     "last": last_sym,
                     "withheld": wcnt,
+                    "published": int(getattr(miner, "published", 0)),
                     "mask": list(mask),
                     "preferred": int(preferred) if preferred is not None else None,
                     "q": q_vals,
@@ -447,19 +456,3 @@ def policy_callback_factory(learner: SarsaLambda,
     return _policy
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    # Smoke test: initialize learner and policy without touching the simulator
-    ctx = ScenarioCtx(alpha=0.3, k=3, mu=0.0833, mode_flag=0)
-    disc = Discretizer()
-    agent = SarsaLambda(gamma=1.0, lam=0.9, alpha=0.05, epsilon=0.1)
-    policy_cb = policy_callback_factory(agent, disc, ctx)
-    # Fake miner with minimal attributes for a quick policy call
-    class _Fake:
-        Bh=10; Bs=11; luck=False; last='h'; _withheld=[object()]
-        def lead(self):
-            return self.Bs - self.Bh
-    fake = _Fake()
-    act = policy_cb(fake, now=0.0)
-    print("Policy callback smoke test (-1/0/1):", act)
-    print("RL SARSA(λ) skeleton ready. Integrate with simulator by passing policy=policy_cb (returns -1/0/1) to SelfishMiner.")

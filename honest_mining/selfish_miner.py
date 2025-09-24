@@ -262,6 +262,7 @@ class SelfishMiner:
         pub_head = self.public.blocks[self.public.selected_head_id]
         prv_head = self.private.blocks[self.private.selected_head_id]
 
+        self.diff_w = self.private.cum_block_weight.get(self.private.selected_head_id, 0) - self.public.cum_block_weight.get(self.public.selected_head_id, 0)
         return int(prv_head.height) - int(pub_head.height)        
 
 
@@ -301,14 +302,14 @@ class SelfishMiner:
             if self.lead < 0:
                 decision = -1
             # elif self.lead == 0:
-            #     # publish one, it will trigger s1 with lead = 0 (line 296)
+            #     # publish one, it will trigger s1 with lead = 0 (line 299)
             #     decision = 1
             # elif self.lead == 1:
-            #     # publish all, it will trigger s1 with lead = 1 (line 290)
+            #     # publish all, it will trigger s1 with lead = 1 (line 294)
             #     decision = 1
 
             else: # self.lead >= 2
-                # publish one, it will trigger s1 with lead >= 2 (line 296)
+                # publish one, it will trigger s1 with lead >= 2 (line 299)
                 decision = 1
             # Longer re-orgs: Only feasible if pure PoW, no PoP (ie, k = 1, D=0 (effectively first-seen))
             # elif self.lead < 2:
