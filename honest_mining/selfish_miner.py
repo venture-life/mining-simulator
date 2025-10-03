@@ -31,6 +31,17 @@ class SelfishMiner:
       Self-delivery uses a tiny epsilon delay to serialize local sub-events.
     - Subsequent publish decisions occur on subsequent DELIVER events (no inner
       tight loop inside a single simulator event).
+
+    Burn-out mode:
+    - When the simulator toggles `burnout=True`, `on_mine()` switches to mining on the
+      PUBLIC head and returns blocks immediately for publication, while `act()` drains
+      any remaining withheld blocks before adopting the public chain.
+
+    Policy integration:
+    - External policies can be provided via the `policy` argument (callables returning
+      {-1, 0, 1} or objects exposing `.step(miner, now) -> int`). When no policy is
+      supplied, `act()` falls back to a minimal built-in heuristic driven by the
+      internal bookkeeping fields (`lead`, `last`, `_withheld`, etc.).
     """
 
     def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
@@ -79,8 +90,9 @@ class SelfishMiner:
         # - External policy (callable) should return an int in {-1, 0, 1} mapping to:
         #   -1 -> adopt, 0 -> hide, 1 -> publish_one
         # - External stepper: object with .step(miner, now) -> int in {-1,0,1}
-        # - If none provided, default to heuristic base policy composed with a StreamingStepper
-        #   whose step(miner, now) returns int in {-1,0,1}.
+        # - When no policy is supplied we still cache the heuristic base policy so it can be
+        #   inspected or wrapped externally, but `_decide_fn` is left unset so that `act()`
+        #   uses its built-in fallback logic.
         self.policy: Optional[Callable[["SelfishMiner", float], Any]] = (policy if callable(policy) else sm_policy.heuristic_policy)
         if callable(policy):
             # Use external as-decider directly: fn(self, now)->int or obj.step(self, now)->int
@@ -90,18 +102,23 @@ class SelfishMiner:
                 self._decide_fn = policy  # type: ignore[assignment]
             self._stepper = None  # not used for external policies
         else:
-            # Internal default: wrap heuristic base policy in a StreamingStepper (int-returning)
-            self._stepper = None #sm_policy.make_streaming_stepper(self.policy)
-            self._decide_fn = None #self._stepper.step
+            # Internal fallback: defer to heuristic rules inside act() instead of a stepper.
+            self._stepper = None  # StreamingStepper integration is currently opt-in.
+            self._decide_fn = None
 
 
 
     # ------------------------- public API (mirror) -------------------------
     def on_receive(self, block: Block, received_time: float) -> None:
         """
-        Receive a block from the network at received_time and update both views.
-        We must clone the incoming block to avoid cross-view mutation of fields
-        like height during connection.
+        Receive a block from the network at `received_time` and update the PUBLIC view.
+
+        Notes
+        -----
+        - Callers are expected to provide a fresh `Block` (the simulator already does) so it can
+          be passed straight into the honest `Miner` without mutating shared state.
+        - The private view remains unchanged here; withheld blocks stay isolated until
+          `_adopt_public()` is triggered.
         """
 
         # Fast path: duplicate delivery → keep earliest first-seen and return
@@ -129,7 +146,11 @@ class SelfishMiner:
 
     def on_mine(self, now: float) -> Optional[Block]:
         """
-        Mine a block on the PRIVATE head and WITHHOLD it (return None).
+        Mine a block according to the current operating mode.
+
+        - Normal mode: extend the PRIVATE head and WITHHOLD the new block (return None).
+        - Burn-out mode: extend the PUBLIC head and return the block immediately so the
+          simulator broadcasts it.
 
         Publishing a withheld block is treated as a local PoP sub-event: the
         simulator may call act(now) multiple times at the same simulation time t.
@@ -267,12 +288,12 @@ class SelfishMiner:
 
 
     def act(self, now: float) -> Optional[Block]:
-        """Perform one streaming decision step (via decider) and execute it.
+        """Perform one decision step and execute it.
 
-        Decider interface: returns an int in {-1, 0, 1}
-        -1 => adopt (perish)
-         0 => hide (no-op)
-         1 => publish exactly one withheld block (if any)
+        - If an external decider (`_decide_fn`) is configured, we invoke it once and interpret
+          the returned int in {-1, 0, 1} as adopt/hide/publish-one.
+        - Otherwise we fall back to the built-in heuristic that inspects `lead`, `last`,
+          `_withheld`, and `burnout` state to choose among the same {-1, 0, 1} actions.
         """
 
         # Burn-out mode: aggressively drain withheld, then align to public.

@@ -77,10 +77,23 @@ def lin_schedule(start: float, end: float, t: int, T: int) -> float:
 def main() -> None:
     args = parse_args()
 
-    mode_flag = 0 if args.mode == "fixed_total" else 1
-    mu = float(args.rate) * float(args.D)
+    mode = str(args.mode)
+    mode_flag = 0 if mode == "fixed_total" else 1
 
-    ctx = ScenarioCtx(alpha=float(args.attacker_share), k=int(args.k), mu=mu, mode_flag=mode_flag)
+    lambda0 = float(args.rate)
+    D0 = float(args.D)
+    a = args.attacker_share
+    f_factor = 1.0
+    if mode == "additive_attacker" and a is not None:
+        a = float(a)
+        if not (0.0 < a < 1.0):
+            raise SystemExit("--attacker-share must be in (0,1) when using additive_attacker mode")
+        f_factor = 1.0 / (1.0 - a)
+    Lambda_eff = lambda0 * f_factor
+    D_eff = D0
+    mu_eff = Lambda_eff * D_eff
+
+    ctx = ScenarioCtx(alpha=float(args.attacker_share), k=int(args.k), mu=mu_eff, mode_flag=mode_flag)
     disc = Discretizer()
     agent = SarsaLambda(gamma=float(args.gamma), lam=float(args.lam), alpha=float(args.alpha), epsilon=float(args.epsilon))
     # Load Q-table if provided
@@ -131,8 +144,8 @@ def main() -> None:
             res = simulate_mining_eventqV2(
                 steps=int(args.steps),
                 groups=int(args.groups),
-                Lambda=float(args.rate),
-                D=float(args.D),
+                Lambda=Lambda_eff,
+                D=D_eff,
                 k=int(args.k),
                 deterministic_selection=(not args.random_tie_break),
                 seed=(None if ep_seed is None else int(ep_seed + i )),
