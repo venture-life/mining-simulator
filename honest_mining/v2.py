@@ -136,6 +136,16 @@ def simulate_mining_eventqV2(
         first_rival_count = 0
         first_rival_sum = 0.0
         first_rival_hist = [0 for _ in range(bins)]
+        # Re-org tracking (miner 0): count head rollbacks by depth via LCA
+        reorg_count = 0
+        reorg_len_counts: Dict[int, int] = {}
+        # Initialize previous head to miner 0's current selection (genesis initially)
+        try:
+            prev_head_id = None
+            if len(locals().get('miners', [])) > 0:
+                prev_head_id = miners[0].selected_head_id
+        except Exception:
+            prev_head_id = None
 
     rng = np.random.default_rng(seed)
 
@@ -221,6 +231,33 @@ def simulate_mining_eventqV2(
                     delay = sample_delay(connectivity_boost=boost) + 2*EPSILON_LOCAL_PUBLISH
                 _push_event(t + delay, 0, (m.miner_id, blk, False))
     # miners already initialized above
+
+    # Helper: compute LCA height between two heads in miner m's local view
+    def _lca_height(m: Miner, id_a: str, id_b: str) -> int:
+        if id_a == id_b:
+            return m.blocks[id_a].height
+        a = m.blocks.get(id_a)
+        b = m.blocks.get(id_b)
+        if a is None or b is None:
+            return 0
+        # Lift the deeper one to the same height
+        while a.height > b.height and a.parent_id is not None:
+            a = m.blocks.get(a.parent_id)
+            if a is None:
+                return 0
+        while b.height > a.height and b.parent_id is not None:
+            b = m.blocks.get(b.parent_id)
+            if b is None:
+                return 0
+        # Walk up together until they meet
+        while a.id != b.id:
+            if a.parent_id is None or b.parent_id is None:
+                return 0
+            a = m.blocks.get(a.parent_id)
+            b = m.blocks.get(b.parent_id)
+            if a is None or b is None:
+                return 0
+        return a.height
 
     # Event queue: (time, kind, seq, payload)
     # kind: 0 = DELIVER, 1 = MINE (DELIVERs at same time process first).
@@ -382,6 +419,26 @@ def simulate_mining_eventqV2(
                             else:
                                 break
             except Exception:
+                pass
+
+        # Re-org detection: track miner 0 head changes and measure rollback depth
+        if track_times:
+            try:
+                if prev_head_id is None:
+                    prev_head_id = miners[0].selected_head_id
+                else:
+                    cur_head_id = miners[0].selected_head_id
+                    if cur_head_id != prev_head_id:
+                        m0 = miners[0]
+                        old_h = m0.blocks.get(prev_head_id).height if prev_head_id in m0.blocks else 0
+                        lca_h = _lca_height(m0, prev_head_id, cur_head_id)
+                        depth = max(0, int(old_h) - int(lca_h))
+                        if depth > 0:
+                            reorg_count += 1
+                            reorg_len_counts[depth] = reorg_len_counts.get(depth, 0) + 1
+                        prev_head_id = cur_head_id
+            except Exception:
+                # Non-fatal; keep simulation running
                 pass
 
         # Note: policy hooks are invoked only for the miner whose local state just changed
@@ -786,12 +843,27 @@ def simulate_mining_eventqV2(
                 "sanity": sanity,
             }
 
+        # Build re-org histogram results
+        if track_times:
+            max_reorg_len = max(reorg_len_counts.keys(), default=0)
+            reorg_len_hist = [reorg_len_counts.get(L, 0) for L in range(1, max_reorg_len + 1)] if max_reorg_len > 0 else []
+            # Integer-length bins: edges at [0, 1, ..., max_len+1]
+            reorg_len_bin_edges = [i for i in range(0, (max_reorg_len + 1) + 1)] if max_reorg_len > 0 else [0, 1]
+            total_reorg_len = sum(L * c for L, c in reorg_len_counts.items())
+            mean_reorg_len = (total_reorg_len / float(reorg_count)) if reorg_count > 0 else None
+
         timing = {
             "enabled": True,
             "first_rival_fraction": first_rival_count / float(steps),
             "mean_first_rival_time": (first_rival_sum / first_rival_count) if first_rival_count > 0 else None,
             "first_rival_hist": first_rival_hist,
             "first_rival_bin_edges": [ (i * max_prop_delay) / float(bins) for i in range(bins + 1) ],
+            "reorgs": {
+                "count": int(reorg_count) if track_times else 0,
+                "mean_length": float(mean_reorg_len) if track_times and (mean_reorg_len is not None) else None,
+                "length_hist": reorg_len_hist if track_times else [],
+                "length_bin_edges": reorg_len_bin_edges if track_times else [],
+            },
             "streaks": streaks,
         }
 

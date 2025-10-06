@@ -177,6 +177,8 @@ def main() -> None:
                     "first_rival_fraction": t.get("first_rival_fraction"),
                     "mean_first_rival_time": t.get("mean_first_rival_time"),
                 }
+                if "reorgs" in t:
+                    summary["reorgs"] = t.get("reorgs")
                 s = t.get("streaks") or None
                 if isinstance(s, dict):
                     summary["streaks"] = {"sanity": s.get("sanity")}
