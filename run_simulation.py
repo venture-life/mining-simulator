@@ -185,6 +185,11 @@ def main() -> None:
                 }
                 if "reorgs" in t:
                     summary["reorgs"] = t.get("reorgs")
+                # Include split reorg metrics in compact summary when available
+                if "reorgs_block" in t:
+                    summary["reorgs_block"] = t.get("reorgs_block")
+                if "reorgs_ws" in t:
+                    summary["reorgs_ws"] = t.get("reorgs_ws")
                 s = t.get("streaks") or None
                 if isinstance(s, dict):
                     summary["streaks"] = {"sanity": s.get("sanity")}

@@ -147,6 +147,11 @@ def simulate_mining_eventqV2(
         # Re-org tracking (miner 0): count head rollbacks by depth via LCA
         reorg_count = 0
         reorg_len_counts: Dict[int, int] = {}
+        # Split counters: block-induced vs work-share-induced reorgs
+        reorg_count_block = 0
+        reorg_len_counts_block: Dict[int, int] = {}
+        reorg_count_ws = 0
+        reorg_len_counts_ws: Dict[int, int] = {}
         # Initialize previous head to miner 0's current selection (genesis initially)
         try:
             prev_head_id = None
@@ -466,6 +471,13 @@ def simulate_mining_eventqV2(
             if deps:
                 _register_pending(mid, obj, t, deps)
             else:
+                # Capture miner 0's head before delivery to split reorgs by event type
+                pre_head_for_split = None
+                if track_times and mid == 0:
+                    try:
+                        pre_head_for_split = miners[0].selected_head_id
+                    except Exception:
+                        pre_head_for_split = None
                 if isinstance(obj, Block):
                     # Deliver a fresh clone to avoid cross-miner state contamination
                     blk = obj
@@ -515,6 +527,21 @@ def simulate_mining_eventqV2(
                     out = act(t)
                     if isinstance(out, (Block, WorkShare)):
                         _broadcast_workobject(out, mid, t)
+                # Split re-org detection for this specific delivery to miner 0
+                if track_times and mid == 0 and pre_head_for_split is not None:
+                    cur_head_id_local = miners[0].selected_head_id
+                    if cur_head_id_local != pre_head_for_split:
+                        m0 = miners[0]
+                        old_h_local = m0.blocks.get(pre_head_for_split).height if pre_head_for_split in m0.blocks else 0
+                        lca_h_local = _lca_height(m0, pre_head_for_split, cur_head_id_local)
+                        depth_local = max(0, int(old_h_local) - int(lca_h_local))
+                        if depth_local > 0:
+                            if isinstance(obj, Block):
+                                reorg_count_block += 1
+                                reorg_len_counts_block[depth_local] = reorg_len_counts_block.get(depth_local, 0) + 1
+                            elif isinstance(obj, WorkShare):
+                                reorg_count_ws += 1
+                                reorg_len_counts_ws[depth_local] = reorg_len_counts_ws.get(depth_local, 0) + 1
 
         # Re-org detection: track miner 0 head changes and measure rollback depth
         if track_times:
@@ -933,24 +960,57 @@ def simulate_mining_eventqV2(
 
         # Build re-org histogram results
         if track_times:
-            max_reorg_len = max(reorg_len_counts.keys(), default=0)
-            reorg_len_hist = [reorg_len_counts.get(L, 0) for L in range(1, max_reorg_len + 1)] if max_reorg_len > 0 else []
+            # Aggregate totals from split counters (block + ws) for primary 'reorgs'
+            agg_len_counts: Dict[int, int] = {}
+            for L, c in reorg_len_counts_block.items():
+                agg_len_counts[L] = agg_len_counts.get(L, 0) + int(c)
+            for L, c in reorg_len_counts_ws.items():
+                agg_len_counts[L] = agg_len_counts.get(L, 0) + int(c)
+            agg_count = int(reorg_count_block) + int(reorg_count_ws)
+            max_reorg_len = max(agg_len_counts.keys(), default=0)
+            reorg_len_hist = [agg_len_counts.get(L, 0) for L in range(1, max_reorg_len + 1)] if max_reorg_len > 0 else []
             # Integer-length bins: edges at [0, 1, ..., max_len+1]
             reorg_len_bin_edges = [i for i in range(0, (max_reorg_len + 1) + 1)] if max_reorg_len > 0 else [0, 1]
-            total_reorg_len = sum(L * c for L, c in reorg_len_counts.items())
-            mean_reorg_len = (total_reorg_len / float(reorg_count)) if reorg_count > 0 else None
+            total_reorg_len = sum(L * c for L, c in agg_len_counts.items())
+            mean_reorg_len = (total_reorg_len / float(agg_count)) if agg_count > 0 else None
+
+            # Block-induced reorgs
+            max_reorg_len_block = max(reorg_len_counts_block.keys(), default=0)
+            reorg_len_hist_block = [reorg_len_counts_block.get(L, 0) for L in range(1, max_reorg_len_block + 1)] if max_reorg_len_block > 0 else []
+            reorg_len_bin_edges_block = [i for i in range(0, (max_reorg_len_block + 1) + 1)] if max_reorg_len_block > 0 else [0, 1]
+            total_reorg_len_block = sum(L * c for L, c in reorg_len_counts_block.items())
+            mean_reorg_len_block = (total_reorg_len_block / float(reorg_count_block)) if reorg_count_block > 0 else None
+
+            # Work-share-induced reorgs
+            max_reorg_len_ws = max(reorg_len_counts_ws.keys(), default=0)
+            reorg_len_hist_ws = [reorg_len_counts_ws.get(L, 0) for L in range(1, max_reorg_len_ws + 1)] if max_reorg_len_ws > 0 else []
+            reorg_len_bin_edges_ws = [i for i in range(0, (max_reorg_len_ws + 1) + 1)] if max_reorg_len_ws > 0 else [0, 1]
+            total_reorg_len_ws = sum(L * c for L, c in reorg_len_counts_ws.items())
+            mean_reorg_len_ws = (total_reorg_len_ws / float(reorg_count_ws)) if reorg_count_ws > 0 else None
 
         timing = {
             "enabled": True,
-            "first_rival_fraction": first_rival_count / float(steps),
+            "first_rival_fraction": (first_rival_count / float(max(1, steps))) if first_rival_count > 0 else 0.0,
             "mean_first_rival_time": (first_rival_sum / first_rival_count) if first_rival_count > 0 else None,
             "first_rival_hist": first_rival_hist,
             "first_rival_bin_edges": [ (i * max_prop_delay) / float(bins) for i in range(bins + 1) ],
             "reorgs": {
-                "count": int(reorg_count) if track_times else 0,
+                "count": int(agg_count) if track_times else 0,
                 "mean_length": float(mean_reorg_len) if track_times and (mean_reorg_len is not None) else None,
                 "length_hist": reorg_len_hist if track_times else [],
                 "length_bin_edges": reorg_len_bin_edges if track_times else [],
+            },
+            "reorgs_block": {
+                "count": int(reorg_count_block) if track_times else 0,
+                "mean_length": float(mean_reorg_len_block) if track_times and (mean_reorg_len_block is not None) else None,
+                "length_hist": reorg_len_hist_block if track_times else [],
+                "length_bin_edges": reorg_len_bin_edges_block if track_times else [],
+            },
+            "reorgs_ws": {
+                "count": int(reorg_count_ws) if track_times else 0,
+                "mean_length": float(mean_reorg_len_ws) if track_times and (mean_reorg_len_ws is not None) else None,
+                "length_hist": reorg_len_hist_ws if track_times else [],
+                "length_bin_edges": reorg_len_bin_edges_ws if track_times else [],
             },
             "streaks": streaks,
         }

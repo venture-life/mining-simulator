@@ -219,19 +219,11 @@ class SelfishMiner:
                             continue
                         if sib_id in self.public.in_time_blocks:
                             uncles_pub.append(sib_id)
-                # Build included WS ids at mine time (PUBLIC view): earliest per version, continuous from v=0
+                # Build included WS ids at mine time (PUBLIC view) via helper: earliest per version, continuous from v=0
                 N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
                 included_pub: List[str] = []
                 if N > 1:
-                    arrs = sorted(getattr(self.public, '_ws_arrivals_by_parent', {}).get(parent_pub.id, []), key=lambda x: float(x[0]))
-                    earliest_by_ver: Dict[int, Tuple[float, str]] = {}
-                    for (t_ws, ws_id, ver) in arrs:
-                        if ver not in earliest_by_ver:
-                            earliest_by_ver[ver] = (t_ws, ws_id)
-                    v = 0
-                    while v in earliest_by_ver:
-                        included_pub.append(earliest_by_ver[v][1])
-                        v += 1
+                    _cnt, included_pub = self.public._continuous_ws_for_parent(parent_pub.id, now)
                 new_block_pub = Block(
                     id=new_id,
                     parent_id=parent_pub.id,
@@ -270,21 +262,11 @@ class SelfishMiner:
                         continue
                     if sib_id in self.public.in_time_blocks:
                         uncles_pub.append(sib_id)
-            # Build included WS ids using both PUBLIC known and PRIVATE withheld arrivals: earliest per version, continuous from v=0
+            # Build included WS ids from PRIVATE view via helper (PRIVATE ingests withheld + public WS for known parents)
             N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
             included_prv: List[str] = []
             if N > 1:
-                arrs_pub = getattr(self.public, '_ws_arrivals_by_parent', {}).get(parent_prv.id, [])
-                arrs_prv = getattr(self.private, '_ws_arrivals_by_parent', {}).get(parent_prv.id, [])
-                arrs = sorted(list(arrs_pub) + list(arrs_prv), key=lambda x: float(x[0]))
-                earliest_by_ver: Dict[int, Tuple[float, str]] = {}
-                for (t_ws, ws_id, ver) in arrs:
-                    if ver not in earliest_by_ver:
-                        earliest_by_ver[ver] = (t_ws, ws_id)
-                v = 0
-                while v in earliest_by_ver:
-                    included_prv.append(earliest_by_ver[v][1])
-                    v += 1
+                _cnt, included_prv = self.private._continuous_ws_for_parent(parent_prv.id, now)
             new_block = Block(
                 id=new_id,
                 parent_id=parent_prv.id,
@@ -304,7 +286,7 @@ class SelfishMiner:
             return None
         else:
             # Withhold a WorkShare that references the PRIVATE branch (same parent as we intend to extend)
-            parent_prv = self.choose_parent_to_mine_upon(now)
+            parent_prv = self.choose_parent_to_mine_upon(now, for_workshare=True)
             pid = parent_prv.id
             base_ver = int(self.private.workshare_count_by_parent.get(pid, 0))
             local_ws = self._withheld_ws_by_parent.get(pid, [])
@@ -322,7 +304,7 @@ class SelfishMiner:
             return None
 
 
-    def choose_parent_to_mine_upon(self, now: float) -> Block:
+    def choose_parent_to_mine_upon(self, now: float, for_workshare: bool = False) -> Block:
         # Choose parent:
         # - Default: use the PRIVATE view's head per fork rules.
         # - Special case (Rule 3 tie and non-deterministic selection):
@@ -373,7 +355,8 @@ class SelfishMiner:
         if parent is None:
             parent = self.private._select_head()
 
-        # WS-aware selection: compare PRIVATE head vs its parent to maximize immediate post-block cumulative weight
+        # WS-aware selection: compare PRIVATE head vs its parent using Miner helper to maximize immediate post-block cumulative weight.
+        # If selecting for a work-share, also add marginal +base when the new WS would extend the contiguous prefix at now.
         N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
         if N > 1 and parent is not None:
             candidates: List[Block] = [parent]
@@ -381,29 +364,16 @@ class SelfishMiner:
                 par = self.private.blocks.get(parent.parent_id)
                 if par is not None:
                     candidates.append(par)
-            base = 1.0 / float(N)
             best_val: Optional[float] = None
             best_cands: List[Block] = []
             for cand in candidates:
-                # In-time classification for the would-be new height in PRIVATE view
-                h_new = int(cand.height) + 1
-                t0 = self.private.first_seen_time_by_height.get(h_new)
-                in_time = (t0 is None) or ((float(now) - float(t0)) <= self.tau)
-                if in_time:
-                    # Count pre-block WS (PRIVATE arrivals) continuous from version 0, up to current time
-                    arrs = sorted(getattr(self.private, '_ws_arrivals_by_parent', {}).get(cand.id, []), key=lambda x: float(x[0]))
-                    earliest_by_ver: Dict[int, Tuple[float, str]] = {}
-                    for (t_ws, ws_id, ver) in arrs:
-                        if float(t_ws) <= float(now) and (ver not in earliest_by_ver):
-                            earliest_by_ver[ver] = (float(t_ws), ws_id)
-                    v = 0
-                    pre_count = 0
-                    while v in earliest_by_ver:
-                        pre_count += 1
-                        v += 1
-                    step = base + base * float(pre_count)
-                else:
-                    step = 0.0
+                step = self.private._prospective_step_if_mined_on(cand, now)
+                if for_workshare and self.work_shares > 1 and self.private._is_in_time(int(cand.height) + 1, now):
+                    cnt, _ = self.private._continuous_ws_for_parent(cand.id, now)
+                    next_ver = int(self.private.workshare_count_by_parent.get(cand.id, 0))
+                    # If the next WS version equals the current contiguous prefix length, adding one now extends the prefix
+                    if next_ver == cnt:
+                        step += (1.0 / float(self.work_shares))
                 prospective = float(self.private.cum_block_weight.get(cand.id, 0.0)) + float(step)
                 if (best_val is None) or (prospective > best_val):
                     best_val = prospective
@@ -470,14 +440,14 @@ class SelfishMiner:
             if self.lead < 0:
                 decision = -1
             # elif self.lead == 0:
-            #     # publish one, it will trigger s1 with lead = 0 (line 299)
+            #     # publish one, it will trigger s1 with lead = 0 (line 437)
             #     decision = 1
             # elif self.lead == 1:
-            #     # publish all, it will trigger s1 with lead = 1 (line 294)
+            #     # publish all, it will trigger s1 with lead = 1 (line 432)
             #     decision = 1
 
             else: # self.lead >= 2
-                # publish one, it will trigger s1 with lead >= 2 (line 299)
+                # publish one, it will trigger s1 with lead >= 2 (line 437)
                 decision = 1
             # Longer re-orgs: Only feasible if pure PoW, no PoP (ie, k = 1, D=0 (effectively first-seen))
             # elif self.lead < 2:
