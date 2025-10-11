@@ -258,7 +258,7 @@ class SelfishMiner:
         # Normal (non-burnout) mode
         if is_block:
             # Mine on PRIVATE head and withhold
-            parent_prv = self.choose_parent_to_mine_upon()
+            parent_prv = self.choose_parent_to_mine_upon(now)
             new_id = f"{self.miner_id}:{self._next_seq}"
             self._next_seq += 1
             # Determine uncles from PUBLIC view for reference
@@ -304,7 +304,7 @@ class SelfishMiner:
             return None
         else:
             # Withhold a WorkShare that references the PRIVATE branch (same parent as we intend to extend)
-            parent_prv = self.choose_parent_to_mine_upon()
+            parent_prv = self.choose_parent_to_mine_upon(now)
             pid = parent_prv.id
             base_ver = int(self.private.workshare_count_by_parent.get(pid, 0))
             local_ws = self._withheld_ws_by_parent.get(pid, [])
@@ -322,7 +322,7 @@ class SelfishMiner:
             return None
 
 
-    def choose_parent_to_mine_upon(self) -> Block:
+    def choose_parent_to_mine_upon(self, now: float) -> Block:
         # Choose parent:
         # - Default: use the PRIVATE view's head per fork rules.
         # - Special case (Rule 3 tie and non-deterministic selection):
@@ -372,6 +372,46 @@ class SelfishMiner:
 
         if parent is None:
             parent = self.private._select_head()
+
+        # WS-aware selection: compare PRIVATE head vs its parent to maximize immediate post-block cumulative weight
+        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        if N > 1 and parent is not None:
+            candidates: List[Block] = [parent]
+            if parent.parent_id is not None:
+                par = self.private.blocks.get(parent.parent_id)
+                if par is not None:
+                    candidates.append(par)
+            base = 1.0 / float(N)
+            best_val: Optional[float] = None
+            best_cands: List[Block] = []
+            for cand in candidates:
+                # In-time classification for the would-be new height in PRIVATE view
+                h_new = int(cand.height) + 1
+                t0 = self.private.first_seen_time_by_height.get(h_new)
+                in_time = (t0 is None) or ((float(now) - float(t0)) <= self.tau)
+                if in_time:
+                    # Count pre-block WS (PRIVATE arrivals) continuous from version 0, up to current time
+                    arrs = sorted(getattr(self.private, '_ws_arrivals_by_parent', {}).get(cand.id, []), key=lambda x: float(x[0]))
+                    earliest_by_ver: Dict[int, Tuple[float, str]] = {}
+                    for (t_ws, ws_id, ver) in arrs:
+                        if float(t_ws) <= float(now) and (ver not in earliest_by_ver):
+                            earliest_by_ver[ver] = (float(t_ws), ws_id)
+                    v = 0
+                    pre_count = 0
+                    while v in earliest_by_ver:
+                        pre_count += 1
+                        v += 1
+                    step = base + base * float(pre_count)
+                else:
+                    step = 0.0
+                prospective = float(self.private.cum_block_weight.get(cand.id, 0.0)) + float(step)
+                if (best_val is None) or (prospective > best_val):
+                    best_val = prospective
+                    best_cands = [cand]
+                elif prospective == best_val:
+                    best_cands.append(cand)
+            if best_cands:
+                parent = self._rng.choice(best_cands) if len(best_cands) > 1 else best_cands[0]
 
         return parent
 
