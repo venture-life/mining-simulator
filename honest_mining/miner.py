@@ -27,6 +27,27 @@ class Block:
     height: int = 0
     uncles: List[str] = field(default_factory=list)
     created_time: float = 0.0
+    # When work_shares > 1: number of work-shares the producer claims to include for this block's parent
+    ws_version: int = 0
+
+
+@dataclass
+class WorkShare:
+    """
+    Lightweight work-share object propagated by the simulator when using N work-shares.
+
+    Notes
+    -----
+    - Work-shares reference the current tip/parent by id and carry a sequential version per parent
+      from the miner's local perspective at creation time, starting at version 0.
+    - They do not alter local chain state/weights; miners only count them per parent to derive
+      the next version when they mine a subsequent work-share on the same parent.
+    """
+    id: str
+    parent_id: Optional[str]
+    miner_id: Optional[int] = None
+    version: int = 0
+    created_time: float = 0.0
 
 
 class Miner:
@@ -57,7 +78,7 @@ class Miner:
         embedded in the in-time blocks along that path.
     """
 
-    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None) -> None:
+    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, work_shares: Optional[int] = None) -> None:
         self.miner_id = miner_id
         # Sanity check: enforce k >= 1 (k=0 behaves like k=1 for 'strictly dominant longest')
         self.k = max(1, int(k))
@@ -66,6 +87,14 @@ class Miner:
         self.tie_break_seed: Optional[int] = (int(tie_break_seed) if tie_break_seed is not None else None)
         # Per-miner RNG for random tie-breaking (seeded by simulator when provided)
         self._rng = random.Random(self.tie_break_seed)
+
+        # Work-share configuration (N). If N <= 1 or unset, behave as standard blocks-only mining.
+        try:
+            self.work_shares: int = int(work_shares) if work_shares is not None else 1
+        except Exception:
+            self.work_shares = 1
+        if self.work_shares <= 0:
+            self.work_shares = 1
 
         # Local block tree
         self.blocks: Dict[str, Block] = {}
@@ -87,11 +116,23 @@ class Miner:
         # Maintain the set of known block ids at each height (used for metrics/analysis)
         self.blocks_by_height: Dict[int, Set[str]] = {}
 
-        # Miner-local cumulative weight per block id
-        self.cum_block_weight: Dict[str, int] = {}
+        # Miner-local cumulative weight per block id (float to support WS-based weights)
+        self.cum_block_weight: Dict[str, float] = {}
+        # Per-block step weight (local contribution at the block)
+        self.step_weight: Dict[str, float] = {}
 
         # Simple local id generator for self-mined blocks
         self._next_seq = 0
+
+        # Work-share tracking:
+        # - workshare_count_by_parent: per-parent NEXT version index (max seen version + 1)
+        #   Used when mining a new work-share to assign `version` for that parent.
+        # - _seen_workshare_ids: de-dup set by work-share id to ignore exact duplicates.
+        self.workshare_count_by_parent: Dict[str, int] = {}
+        self._seen_workshare_ids: Set[str] = set()
+        # WS arrival times by parent, for initial block weight; and per-block counted WS ids
+        self._ws_arrivals_by_parent: Dict[str, List[Tuple[float, str]]] = {}
+        self._ws_counted_by_block: Dict[str, Set[str]] = {}
 
         # Genesis
         genesis = Block(id=genesis_id, parent_id=None, miner_id=None, height=0, uncles=[], created_time=0.0)
@@ -129,35 +170,102 @@ class Miner:
         # Update selected head after processing this receive
         self._update_selected_head()
 
-    def on_mine(self, now: float) -> Block:
+    def on_mine(self, now: float):
         """
         Called when this miner wins the lottery at time `now`.
-        Select a parent head by fork-resolution rules, create a new block, embed
-        eligible uncle references, and return the new block (for broadcasting).
 
-        Note: Do not deliver to self here; the simulator will schedule deliveries
-        (including to self with a tiny epsilon delay) via its event queue.
+        When work_shares = N > 1, with probability 1/N we mine a real block (legacy behavior).
+        Otherwise, we mine a work-share that references the current parent tip and assign a
+        version equal to the number of work-shares we have already seen for that parent.
+
+        Returns
+        -------
+        Block | WorkShare
+            A Block when a real block is mined, else a WorkShare instance.
+
+        Note
+        ----
+        Do not deliver to self here; the simulator will schedule deliveries (including to self
+        with a tiny epsilon delay) via its event queue.
         """
         parent = self._select_head()
         # Track the selected parent head at the time of mining
         self.selected_head_id = parent.id
-        new_id = f"{self.miner_id}:{self._next_seq}"
-        self._next_seq += 1
 
-        # Determine uncles: siblings of parent that are in-time (from this miner's view)
-        uncles: List[str] = []
-        if parent.parent_id is not None:
-            gp = parent.parent_id
-            for sib_id in self.children.get(gp, []):
-                if sib_id == parent.id:
+        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        if N <= 1 or self._rng.random() <= (1.0 / float(N)):
+            # Produce a real block (legacy path)
+            new_id = f"{self.miner_id}:{self._next_seq}"
+            self._next_seq += 1
+
+            # Determine uncles: siblings of parent that are in-time (from this miner's view)
+            uncles: List[str] = []
+            if parent.parent_id is not None:
+                gp = parent.parent_id
+                for sib_id in self.children.get(gp, []):
+                    if sib_id == parent.id:
+                        continue
+                    if sib_id in self.in_time_blocks:
+                        uncles.append(sib_id)
+
+            # Capture WS include count at mining time for this parent (as claimed by producer)
+            ws_ver = int(self.workshare_count_by_parent.get(parent.id, 0)) if N > 1 else 0
+            new_block = Block(
+                id=new_id,
+                parent_id=parent.id,
+                miner_id=self.miner_id,
+                height=parent.height + 1,
+                uncles=uncles,
+                created_time=now,
+                ws_version=ws_ver,
+            )
+            return new_block
+
+        # Produce a work-share for the current parent
+        pid = parent.id
+        cur = self.workshare_count_by_parent.get(pid, 0)
+        ws_id = f"WS:{self.miner_id}:{pid}:{cur}"
+        ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=cur, created_time=now)
+        return ws
+
+    def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
+        """
+        Receive a work-share and update per-parent counts. Duplicate deliveries are ignored.
+        """
+        if ws.id in self._seen_workshare_ids:
+            return
+        self._seen_workshare_ids.add(ws.id)
+        pid = ws.parent_id or "GENESIS"
+        # Update next-version index as max(current, ws.version + 1) to avoid over-counting
+        # when multiple distinct work-shares exist at the same version for this parent.
+        cur_next = self.workshare_count_by_parent.get(pid, 0)
+        v = int(getattr(ws, "version", 0) or 0)
+        self.workshare_count_by_parent[pid] = max(cur_next, v + 1)
+        # Record arrival for future blocks referencing this parent
+        self._ws_arrivals_by_parent.setdefault(pid, []).append((received_time, ws.id))
+        # If WS-based weighting is enabled (N>1), apply late WS within tau to eligible child blocks
+        if self.work_shares and int(self.work_shares) > 1:
+            base = 1.0 / float(int(self.work_shares))
+            changed = False
+            for bid in list(self.children.get(pid, [])):
+                if bid not in self.blocks:
                     continue
-                if sib_id in self.in_time_blocks:
-                    uncles.append(sib_id)
-
-        new_block = Block(id=new_id, parent_id=parent.id, miner_id=self.miner_id, height=parent.height + 1, uncles=uncles, created_time=now)
-
-        # Do not deliver to self immediately; return for broadcast by simulator
-        return new_block
+                t_block = self.block_first_seen.get(bid)
+                if t_block is None:
+                    continue
+                # Include WS if it arrives within [t_block, t_block + tau] AND the child block is in-time
+                if (received_time >= t_block) and (received_time <= t_block + self.tau) and (bid in self.in_time_blocks):
+                    counted = self._ws_counted_by_block.setdefault(bid, set())
+                    # Respect producer-declared cap for this block
+                    blk_obj = self.blocks.get(bid)
+                    cap = int(getattr(blk_obj, "ws_version", 0) or 0) if blk_obj is not None else 0
+                    if (ws.id not in counted) and (len(counted) < cap):
+                        counted.add(ws.id)
+                        self.step_weight[bid] = float(self.step_weight.get(bid, 0.0)) + base
+                        self._propagate_weight_delta_from(bid, base)
+                        changed = True
+            if changed:
+                self._update_selected_head()
 
     # ------------------------- internal helpers -------------------------
     def _add_block_connected(self, block: Block, received_time: float) -> None:
@@ -221,16 +329,50 @@ class Miner:
                 # Ensure it's not incorrectly marked in-time
                 self.in_time_blocks.discard(block.id)
 
-        # Compute and store cumulative weight incrementally
-        # Step weight: only if this block is in-time, count 1 + number of in-time uncles it references
-        step_w = 0
-        if block.id in self.in_time_blocks:
-            step_w = 1
-            for u in block.uncles:
-                if u in self.in_time_blocks:
-                    step_w += 1
-        parent_w = 0 if block.parent_id is None else self.cum_block_weight.get(block.parent_id, 0)
-        self.cum_block_weight[block.id] = parent_w + step_w
+        # Compute and store step weight and cumulative weight
+        if self.work_shares and int(self.work_shares) > 1:
+            # WS-based weighting: ignore uncles. Gate by in-time classification.
+            base = 1.0 / float(int(self.work_shares))
+            if block.id in self.in_time_blocks:
+                step_w = base
+                pid = block.parent_id or "GENESIS"
+                counted = self._ws_counted_by_block.setdefault(block.id, set())
+                # Respect block's declared include cap
+                cap = int(getattr(block, "ws_version", 0) or 0)
+                # Include any WS that arrived before this block, up to cap
+                arrs = sorted(self._ws_arrivals_by_parent.get(pid, []), key=lambda x: float(x[0]))
+                for (t_ws, ws_id) in arrs:
+                    if len(counted) >= cap:
+                        break
+                    if t_ws <= t_recv and ws_id not in counted:
+                        step_w += base
+                        counted.add(ws_id)
+                self.step_weight[block.id] = float(step_w)
+            else:
+                # Late block at this height contributes zero weight in WS mode
+                self.step_weight[block.id] = 0.0
+        else:
+            # Legacy weighting: block counts only if in-time; include in-time uncles
+            step_w_f = 0.0
+            if block.id in self.in_time_blocks:
+                step_w_f = 1.0
+                for u in block.uncles:
+                    if u in self.in_time_blocks:
+                        step_w_f += 1.0
+            self.step_weight[block.id] = float(step_w_f)
+        parent_w = 0.0 if block.parent_id is None else float(self.cum_block_weight.get(block.parent_id, 0.0))
+        self.cum_block_weight[block.id] = parent_w + float(self.step_weight.get(block.id, 0.0))
+
+    def _propagate_weight_delta_from(self, bid: str, delta: float) -> None:
+        """Propagate a step-weight increment delta from block bid to all its descendants."""
+        if not delta:
+            return
+        # Update this block and all descendants cumulatively
+        stack = [bid]
+        while stack:
+            x = stack.pop()
+            self.cum_block_weight[x] = float(self.cum_block_weight.get(x, 0.0)) + delta
+            stack.extend(self.children.get(x, []))
 
     def _update_selected_head(self) -> None:
         """Refresh the cached selected mining head according to current fork-resolution rules."""

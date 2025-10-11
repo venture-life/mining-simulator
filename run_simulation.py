@@ -17,6 +17,7 @@ def main() -> None:
     p_mine_v2.add_argument("--shares", type=str, default=None, help="Comma-separated shares summing to 1 (default: equal)")
     p_mine_v2.add_argument("--steps", type=int, default=1000, help="Number of heights to simulate")
     p_mine_v2.add_argument("--rate", type=float, default=1.0/120.0, help="Global block rate Λ (blocks/sec)")
+    p_mine_v2.add_argument("--work-shares", type=int, default=1, help="Number of work-shares N; if N>1, blocks occur with prob 1/N and Λ is scaled by N")
     p_mine_v2.add_argument("--window", type=float, default=5.0, help="Δ window seconds for in-window rivals")
     p_mine_v2.add_argument("--max-prop-delay", type=float, default=2.5, help="Max per-delivery propagation delay cap in seconds (default: 2.5). Decoupled from --window.")
     p_mine_v2.add_argument("--k", type=int, default=3, help="Fork-resolution dominance k for the longest-chain rule")
@@ -85,7 +86,11 @@ def main() -> None:
             if not (0.0 < float(a) < 1.0):
                 raise SystemExit("--attacker-share must be in (0,1) when using additive_attacker mode")
             f_factor = 1.0 / (1.0 - float(a))
-        Lambda_eff = lambda0 * f_factor
+        # Scale by work-shares N to keep expected block interval at base when N>1
+        N_ws = int(getattr(args, "work_shares", 1) or 1)
+        if N_ws <= 0:
+            N_ws = 1
+        Lambda_eff = lambda0 * f_factor * float(N_ws)
         D_eff = D0  # Physical mode only: keep D fixed; concurrency μ varies with Λ
         MPD_eff = float(args.max_prop_delay)
 
@@ -136,6 +141,7 @@ def main() -> None:
             trace_limit=args.trace_limit,
             attacker_share=args.attacker_share,
             selfish_policy=policy_cb,
+            work_shares=N_ws,
         )
         d = res.to_dict()
         keys = (

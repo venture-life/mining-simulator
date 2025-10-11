@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import random
 import logging
-from typing import Dict, List, Optional, Set, Tuple, Callable, Any
-from .miner import Miner, Block
+from typing import Dict, List, Optional, Set, Tuple, Callable, Any, Union
+from .miner import Miner, Block, WorkShare
 from . import policy as sm_policy
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class SelfishMiner:
       internal bookkeeping fields (`lead`, `last`, `_withheld`, etc.).
     """
 
-    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None) -> None:
+    def __init__(self, miner_id: int, k: int, tau: float, *, genesis_id: str = "GENESIS", deterministic_selection: bool = True, tie_break_seed: Optional[int] = None, alpha: Optional[float] = None, policy: Optional[Callable[["SelfishMiner", float], Any]] = None, work_shares: Optional[int] = None) -> None:
         self.miner_id = int(miner_id)
         # Sanity check: enforce k >= 1 (k=0 behaves like k=1 for 'strictly dominant longest')
         self.k = max(1, int(k))
@@ -52,16 +52,38 @@ class SelfishMiner:
         # Propagate tie-break style to internal honest miners
         self.deterministic_selection: bool = bool(deterministic_selection)
         self.tie_break_seed: Optional[int] = (int(tie_break_seed) if tie_break_seed is not None else None)
+        # RNG for local stochastic decisions (e.g., work-share dice)
+        self._rng = random.Random(self.tie_break_seed)
 
         # Internal honest miners for the two views
-        self.public = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id, deterministic_selection=self.deterministic_selection, tie_break_seed=self.tie_break_seed)
-        self.private = Miner(miner_id=self.miner_id, k=self.k, tau=self.tau, genesis_id=genesis_id, deterministic_selection=self.deterministic_selection, tie_break_seed=self.tie_break_seed)
+        self.public = Miner(
+            miner_id=self.miner_id,
+            k=self.k,
+            tau=self.tau,
+            genesis_id=genesis_id,
+            deterministic_selection=self.deterministic_selection,
+            tie_break_seed=self.tie_break_seed,
+            work_shares=work_shares,
+        )
+        self.private = Miner(
+            miner_id=self.miner_id,
+            k=self.k,
+            tau=self.tau,
+            genesis_id=genesis_id,
+            deterministic_selection=self.deterministic_selection,
+            tie_break_seed=self.tie_break_seed,
+            work_shares=work_shares,
+        )
 
         # Local sequence for ids when crafting blocks directly (if needed later)
         self._next_seq = 0
 
         # Queue of withheld blocks (kept only in private view until published)
         self._withheld: List[Block] = []
+        # Withheld work-shares by parent id (kept private until publishing the corresponding block)
+        self._withheld_ws_by_parent: Dict[str, List[WorkShare]] = {}
+        # Release queue for publishing a block and its associated WS in sequence
+        self._pending_release: List[object] = []
 
 
         # Track last event context to drive minimal publishing logic
@@ -85,6 +107,14 @@ class SelfishMiner:
         # - act(): aggressively publishes withheld blocks until empty, then adopts public.
         # - on_mine(): in burnout, mine on PUBLIC head and immediately publish (return Block).
         self.burnout: bool = False
+
+        # Work-share configuration (N); if N<=1, behave as blocks-only
+        try:
+            self.work_shares: int = int(work_shares) if work_shares is not None else 1
+        except Exception:
+            self.work_shares = 1
+        if self.work_shares <= 0:
+            self.work_shares = 1
 
         # Optional policy hook (pluggable):
         # - External policy (callable) should return an int in {-1, 0, 1} mapping to:
@@ -144,13 +174,26 @@ class SelfishMiner:
         self._local_event_id += 1
 
 
-    def on_mine(self, now: float) -> Optional[Block]:
-        """
-        Mine a block according to the current operating mode.
+    def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
+        """Forward work-share deliveries to the PUBLIC view for bookkeeping.
 
-        - Normal mode: extend the PRIVATE head and WITHHOLD the new block (return None).
-        - Burn-out mode: extend the PUBLIC head and return the block immediately so the
-          simulator broadcasts it.
+        Selfish miners ignore work-shares for strategy but keep counts per parent for
+        versioning semantics when interoperability is needed.
+        """
+        self.public.on_receive_workshare(ws, received_time)
+        if ws.parent_id in self.private.blocks:
+            self.private.on_receive_workshare(ws,received_time)
+        
+
+
+    def on_mine(self, now: float):
+        """
+        Mine according to the current operating mode and work-share setting.
+
+        - With work_shares = N > 1: mine a real block with probability 1/N; otherwise emit a
+          WorkShare that references the PUBLIC head. In normal (non-burnout) mode, real blocks
+          are mined on the PRIVATE head and withheld (return None).
+        - Burn-out mode: extend the PUBLIC head; if a real block is mined, return it immediately.
 
         Publishing a withheld block is treated as a local PoP sub-event: the
         simulator may call act(now) multiple times at the same simulation time t.
@@ -158,70 +201,103 @@ class SelfishMiner:
         after which the policy is consulted again on the new state to decide
         whether to publish another withheld block.
         """
-        # If in burn-out mode, switch to honest-like behavior: mine on PUBLIC head and publish immediately.
+        # Decide Block vs WorkShare
+        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        is_block = (N <= 1) or (self._rng.random() <= (1.0 / float(N)))
+
+        # Burn-out: honest-like behavior on PUBLIC head
         if self.burnout:
-            # Select parent from PUBLIC view
             parent_pub = self.public._select_head()
+            if is_block:
+                new_id = f"{self.miner_id}:{self._next_seq}"
+                self._next_seq += 1
+                uncles_pub: List[str] = []
+                if parent_pub.parent_id is not None:
+                    gp = parent_pub.parent_id
+                    for sib_id in self.public.children.get(gp, []):
+                        if sib_id == parent_pub.id:
+                            continue
+                        if sib_id in self.public.in_time_blocks:
+                            uncles_pub.append(sib_id)
+                # Include ws_version from PUBLIC view counts at parent_pub
+                N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+                ws_ver_pub = int(self.public.workshare_count_by_parent.get(parent_pub.id, 0)) if N > 1 else 0
+                new_block_pub = Block(
+                    id=new_id,
+                    parent_id=parent_pub.id,
+                    miner_id=self.miner_id,
+                    height=parent_pub.height + 1,
+                    uncles=uncles_pub,
+                    created_time=now,
+                    ws_version=ws_ver_pub,
+                )
+                self._last_event = "mine"
+                self.last = 's0'
+                self._local_event_id += 1
+                return new_block_pub
+            else:
+                pid = parent_pub.id
+                ver = self.public.workshare_count_by_parent.get(pid, 0)
+                ws_id = f"WS:{self.miner_id}:{pid}:{ver}"
+                ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=ver, created_time=now)
+                self._last_event = "mine"
+                self.last = 's0'
+                self._local_event_id += 1
+                return ws
+
+        # Normal (non-burnout) mode
+        if is_block:
+            # Mine on PRIVATE head and withhold
+            parent_prv = self.choose_parent_to_mine_upon()
             new_id = f"{self.miner_id}:{self._next_seq}"
             self._next_seq += 1
-            # Determine uncles from PUBLIC siblings of the chosen parent
+            # Determine uncles from PUBLIC view for reference
             uncles_pub: List[str] = []
-            if parent_pub.parent_id is not None:
-                gp = parent_pub.parent_id
+            if parent_prv.parent_id is not None:
+                gp = parent_prv.parent_id
                 for sib_id in self.public.children.get(gp, []):
-                    if sib_id == parent_pub.id:
+                    if sib_id == parent_prv.id:
                         continue
                     if sib_id in self.public.in_time_blocks:
                         uncles_pub.append(sib_id)
-            new_block_pub = Block(
+            # Include ws_version from PUBLIC view counts at parent_prv (private WS are not tracked network-wide)
+            N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+            ws_ver_prv = int(self.public.workshare_count_by_parent.get(parent_prv.id, 0)) if N > 1 else 0
+            new_block = Block(
                 id=new_id,
-                parent_id=parent_pub.id,
+                parent_id=parent_prv.id,
                 miner_id=self.miner_id,
-                height=parent_pub.height + 1,
+                height=parent_prv.height + 1,
                 uncles=uncles_pub,
                 created_time=now,
+                ws_version=ws_ver_prv,
             )
-            # Do not mutate local state here; simulator will broadcast and then deliver (including to self)
+            # Receive locally into PRIVATE view only; do not broadcast yet
+            self.private.on_receive(new_block, received_time=now)
+            self._withheld.append(new_block)
             self._last_event = "mine"
             self.last = 's0'
-            # lead will be recomputed on delivery
+            self.lead = self.get_lead()
             self._local_event_id += 1
-            return new_block_pub
-       
-        parent = self.choose_parent_to_mine_upon()
+            return None
+        else:
+            # Withhold a WorkShare that references the PRIVATE branch (same parent as we intend to extend)
+            parent_prv = self.choose_parent_to_mine_upon()
+            pid = parent_prv.id
+            base_ver = int(self.private.workshare_count_by_parent.get(pid, 0))
+            local_ws = self._withheld_ws_by_parent.get(pid, [])
+            ver = base_ver + len(local_ws)
+            ws_id = f"WS:{self.miner_id}:{pid}:{ver}"
+            ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=ver, created_time=now)
+            # Keep withheld and update PRIVATE view so our private weights reflect this WS immediately
+            self._withheld_ws_by_parent.setdefault(pid, []).append(ws)
 
-        new_id = f"{self.miner_id}:{self._next_seq}"
-        self._next_seq += 1
+            self.private.on_receive_workshare(ws, received_time=now)
 
-        # Determine uncles: siblings of parent that are in-time (from PUBLIC knowledge)
-        uncles: List[str] = []
-        if parent.parent_id is not None:
-            gp = parent.parent_id
-            for sib_id in self.public.children.get(gp, []):
-                if sib_id == parent.id:
-                    continue
-                if sib_id in self.public.in_time_blocks:
-                    uncles.append(sib_id)
-                    
-        new_block = Block(
-            id=new_id,
-            parent_id=parent.id,
-            miner_id=self.miner_id,
-            height=parent.height + 1,
-            uncles=uncles,
-            created_time=now,
-        )
-
-        # Receive locally into PRIVATE view only; do not broadcast yet
-        self.private.on_receive(new_block, received_time=now)
-        self._withheld.append(new_block)
-        self._last_event = "mine"
-        self.last = 's0'
-        self.lead = self.get_lead()
-
-        # Increment local event counter (idempotence key)
-        self._local_event_id += 1
-        return None
+            self._last_event = "mine"
+            self.last = 's0'
+            self._local_event_id += 1
+            return None
 
 
     def choose_parent_to_mine_upon(self) -> Block:
@@ -287,17 +363,26 @@ class SelfishMiner:
         return int(prv_head.height) - int(pub_head.height)        
 
 
-    def act(self, now: float) -> Optional[Block]:
+    def act(self, now: float) -> Optional[Union[Block, WorkShare]]:
         """Perform one decision step and execute it.
 
         - If an external decider (`_decide_fn`) is configured, we invoke it once and interpret
           the returned int in {-1, 0, 1} as adopt/hide/publish-one.
         - Otherwise we fall back to the built-in heuristic that inspects `lead`, `last`,
           `_withheld`, and `burnout` state to choose among the same {-1, 0, 1} actions.
+        
+        Returns
+        -------
+        Optional[Block | WorkShare]
+            When publishing, this returns either the next withheld Block or one of its
+            associated WorkShares as the release queue drains. Otherwise, returns None.
         """
 
+        # If we have a pending release batch (block and its WS), prioritize publishing.
+        if self._pending_release:
+            decision = 1
         # Burn-out mode: aggressively drain withheld, then align to public.
-        if self.burnout:
+        elif self.burnout:
             if self._withheld:
                 decision = 1
             else:
@@ -347,19 +432,46 @@ class SelfishMiner:
 
 
     # ------------------------- actions -------------------------------------
-    def _publish_one(self, now: float) -> Optional[Block]:
-        """Publish exactly one withheld block if available; return the block or None."""
+    def _publish_one(self, now: float) -> Optional[Union[Block, WorkShare]]:
+        """
+        Publish the next item in the release queue, or if empty:
+        - Take one withheld block and enqueue its withheld WS first (same parent.id), then the block.
+        Returns one object (WS first, then Block) for the simulator to broadcast.
+        """
+        # If we have a pending release batch, continue publishing it
+        if self._pending_release:
+            item = self._pending_release.pop(0)
+            if isinstance(item, Block):
+                # Do not deliver to self here; simulator will broadcast (including self) with epsilon
+                self.published += 1
+            return item
+        # Seed a new release batch with the next withheld block
         if not self._withheld:
             return None
         b = self._withheld.pop(0)
-        # Do not deliver to self here; simulator will broadcast (including self) with epsilon
-        self.published += 1
-        return b
+        pid = b.parent_id
+        ws_list = list(self._withheld_ws_by_parent.get(pid, []))
+        # Sort WS by version to keep sequence consistent
+        try:
+            ws_list.sort(key=lambda w: int(getattr(w, 'version', 0) or 0))
+        except Exception:
+            pass
+        # Enqueue WS first, then the associated block
+        self._pending_release = ws_list + [b]
+        # Clear the withheld WS for this parent now that they will be published
+        if pid is not None:
+            self._withheld_ws_by_parent.pop(pid, None)
+        item = self._pending_release.pop(0)
+        if isinstance(item, Block):
+            self.published += 1
+        return item
 
     def _adopt_public(self) -> None:
         """Give up private chain: align private view to public and clear withheld."""
         self.private = self._clone_miner_state(self.public)
         self._withheld.clear()
+        self._withheld_ws_by_parent.clear()
+        self._pending_release.clear()
         # Reset published counter to reflect "since adopt" semantics
         self.published = 0
         self.lead = self.get_lead()
@@ -389,7 +501,7 @@ class SelfishMiner:
         return self.public.max_height
 
     @property
-    def cum_block_weight(self) -> Dict[str, int]:
+    def cum_block_weight(self) -> Dict[str, float]:
         return self.public.cum_block_weight
 
     @property
@@ -418,6 +530,7 @@ class SelfishMiner:
             genesis_id="GENESIS",
             deterministic_selection=getattr(src, 'deterministic_selection', True),
             tie_break_seed=getattr(src, 'tie_break_seed', None),
+            work_shares=getattr(src, 'work_shares', 1),
         )
         # Clone blocks (dataclass) by value
         dst.blocks = {}
@@ -429,6 +542,7 @@ class SelfishMiner:
                 height=b.height,
                 uncles=list(b.uncles),
                 created_time=b.created_time,
+                ws_version=getattr(b, "ws_version", 0),
             )
         # Shallow-copy id structures (ids refer to dst.blocks keys)
         dst.children = {pid: list(ch) for pid, ch in src.children.items()}
@@ -441,8 +555,20 @@ class SelfishMiner:
         dst.in_time_blocks = set(src.in_time_blocks)
         dst.block_first_seen = dict(src.block_first_seen)
         dst.blocks_by_height = {h: set(bids) for h, bids in src.blocks_by_height.items()}
-        # Copy cumulative weights
+        # Copy cumulative and step weights
         dst.cum_block_weight = dict(src.cum_block_weight)
+        try:
+            dst.step_weight = dict(getattr(src, 'step_weight', {}))
+        except Exception:
+            pass
+        # Copy WS bookkeeping if present
+        try:
+            dst.workshare_count_by_parent = dict(getattr(src, 'workshare_count_by_parent', {}))
+            dst._seen_workshare_ids = set(getattr(src, '_seen_workshare_ids', set()))
+            dst._ws_arrivals_by_parent = {k: list(v) for k, v in getattr(src, '_ws_arrivals_by_parent', {}).items()}
+            dst._ws_counted_by_block = {k: set(v) for k, v in getattr(src, '_ws_counted_by_block', {}).items()}
+        except Exception:
+            pass
         # Preserve selected head
         dst.selected_head_id = src.selected_head_id
         # Preserve RNG state for random tie-breaking so CF matches continuation
@@ -464,6 +590,7 @@ class SelfishMiner:
             height=0,  # receiver will derive
             uncles=list(b.uncles),
             created_time=b.created_time,
+            ws_version=getattr(b, "ws_version", 0),
         )
 
     

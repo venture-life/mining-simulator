@@ -94,24 +94,12 @@ def plot_local_chains_eventq_v2(
                     height_map.setdefault(to_m, {})[bid] = ev.get("height")
                 if "weight" in ev:
                     weight_map.setdefault(to_m, {})[bid] = ev.get("weight")
-        elif ev["type"] == "PUBLISH":
-            # Selfish miner publication (no direct MINE trace); treat like MINE for origin metadata
-            bid = str(ev.get("block_id"))
-            m = int(ev.get("miner"))
-            origin[bid] = m
-            parent[bid] = ev.get("parent_id")
-            height_map.setdefault(m, {})[bid] = ev.get("height")
-            weight_map.setdefault(m, {})[bid] = ev.get("weight")
 
     # Build first-seen times per miner for each block
     seen_time: Dict[int, Dict[str, float]] = {m: {} for m in range(groups)}
     # MINE: miner sees immediately at t
     for ev in trace:
         if ev["type"] == "MINE":
-            m = int(ev["miner"]) ; bid = str(ev["block_id"]) ; t = float(ev["t"])
-            seen_time[m][bid] = min(t, seen_time[m].get(bid, t))
-        elif ev["type"] == "PUBLISH":
-            # Publication by selfish miner: mark first-seen in attacker's lane at publish time
             m = int(ev["miner"]) ; bid = str(ev["block_id"]) ; t = float(ev["t"])
             seen_time[m][bid] = min(t, seen_time[m].get(bid, t))
     # DELIVER: 'to' miner sees at t_deliver
@@ -129,8 +117,6 @@ def plot_local_chains_eventq_v2(
         elif ev["type"] == "DELIVER":
             all_times.append(float(ev.get("t_deliver", 0.0)))
             all_times.append(float(ev.get("t_mine", 0.0)))
-        elif ev["type"] == "PUBLISH":
-            all_times.append(float(ev.get("t", 0.0)))
 
     if not all_times:
         raise ValueError("Trace has no timestamps.")
@@ -429,7 +415,6 @@ def plot_local_chains_eventq_v2(
         if p_to is not None:
             y1 = p_to[1]
         # Direct arrow from source center to target center (previous style)
-        repair = bool(ev.get("repair", False))
         # Prefer exact block centers if positions are known; fall back to time-mapped x
         x0 = (p_from[0] if p_from is not None else (t_to_x[t0] if t_to_x is not None else t0))
         x1 = (p_to[0] if p_to is not None else (t_to_x[t1] if t_to_x is not None else t1))
@@ -438,7 +423,7 @@ def plot_local_chains_eventq_v2(
             color=colors[f],
             lw=1.0,
             alpha=0.7,
-            linestyle="--" if repair else "-",
+            linestyle="-",
             shrinkA=2,
             shrinkB=2,
             zorder=4,
