@@ -108,6 +108,9 @@ class SelfishMiner:
         # - on_mine(): in burnout, mine on PUBLIC head and immediately publish (return Block).
         self.burnout: bool = False
 
+        # Private view aliasing: when True, self.private references self.public and must not be mutated
+        self._private_alias: bool = False
+
         # Work-share configuration (N); if N<=1, behave as blocks-only
         try:
             self.work_shares: int = int(work_shares) if work_shares is not None else 1
@@ -181,8 +184,9 @@ class SelfishMiner:
         versioning semantics when interoperability is needed.
         """
         self.public.on_receive_workshare(ws, received_time)
-        if ws.parent_id in self.private.blocks:
-            self.private.on_receive_workshare(ws,received_time)
+        # If PRIVATE aliases PUBLIC, the PUBLIC update already applied; avoid double-processing
+        if (not self._private_alias) and (ws.parent_id in self.private.blocks):
+            self.private.on_receive_workshare(ws, received_time)
         
 
 
@@ -278,6 +282,7 @@ class SelfishMiner:
                 included_ws_ids=included_prv,
             )
             # Receive locally into PRIVATE view only; do not broadcast yet
+            self._ensure_private_materialized()
             self.private.on_receive(new_block, received_time=now)
             self._withheld.append(new_block)
             self._last_event = "mine"
@@ -296,7 +301,7 @@ class SelfishMiner:
             ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=ver, created_time=now)
             # Keep withheld and update PRIVATE view so our private weights reflect this WS immediately
             self._withheld_ws_by_parent.setdefault(pid, []).append(ws)
-
+            self._ensure_private_materialized()
             self.private.on_receive_workshare(ws, received_time=now)
 
             self._last_event = "mine"
@@ -458,7 +463,9 @@ class SelfishMiner:
             #     decision = 0
 
         if decision < 0:
-            self._adopt_public()
+            # Adopt if we have withheld OR our private head is out of sync with public
+            if self._withheld or (self.private.selected_head_id != self.public.selected_head_id):
+                self._adopt_public()
             return None
         if decision > 0:
             return self._publish_one(now)
@@ -520,13 +527,21 @@ class SelfishMiner:
 
     def _adopt_public(self) -> None:
         """Give up private chain: align private view to public and clear withheld."""
-        self.private = self._clone_miner_state(self.public)
+        # Copy-on-write fast path: alias PRIVATE to PUBLIC; materialize on next divergence
+        self.private = self.public
+        self._private_alias = True
         self._withheld.clear()
         self._withheld_ws_by_parent.clear()
         self._pending_release.clear()
         # Reset published counter to reflect "since adopt" semantics
         self.published = 0
         self.lead = self.get_lead()
+
+    def _ensure_private_materialized(self) -> None:
+        """Ensure PRIVATE is a distinct Miner before mutating it when aliasing PUBLIC."""
+        if self._private_alias:
+            self.private = self._clone_miner_state(self.public)
+            self._private_alias = False
 
 
     # ------------------------- view forwarding (read-only) -----------------
@@ -584,38 +599,96 @@ class SelfishMiner:
             tie_break_seed=getattr(src, 'tie_break_seed', None),
             work_shares=getattr(src, 'work_shares', 1),
         )
-        # Share Block objects by reference (Blocks are immutable post-receive)
-        dst.blocks = {bid: b for bid, b in src.blocks.items()}
-        # Shallow-copy id structures (ids refer to dst.blocks keys)
-        dst.children = {pid: list(ch) for pid, ch in src.children.items()}
-        dst.leaves = set(src.leaves)
-        dst.max_height = int(src.max_height)
-        # Copy leaves_by_height index for fast head selection
-        dst.leaves_by_height = {h: set(bids) for h, bids in getattr(src, 'leaves_by_height', {}).items()}
-        # Copy timing and classification maps/sets
+        # Compute windowed subset of the DAG to clone
+        try:
+            wsN = int(getattr(src, 'work_shares', 1) or 1)
+        except Exception:
+            wsN = 1
+        if wsN <= 0:
+            wsN = 1
+        W = max(1, int(src.k) * int(wsN) * 10)
+        H_max = int(getattr(src, 'max_height', 0))
+        H_cut = max(0, H_max - W)
+
+        # S: blocks with height >= H_cut
+        S: set[str] = set()
+        for h, ids in src.blocks_by_height.items():
+            if int(h) >= H_cut:
+                S.update(ids)
+        # Hinge parents P1: immediate parents of S
+        P1: set[str] = set()
+        for bid in list(S):
+            b = src.blocks.get(bid)
+            if b is not None and b.parent_id is not None:
+                P1.add(b.parent_id)
+        R: set[str] = set(S)
+        R.update(P1)
+
+        # Share Block objects by reference for R only
+        dst.blocks = {bid: src.blocks[bid] for bid in R if bid in src.blocks}
+        # Rebuild children: for any node x in R, keep only children within S
+        dst.children = {}
+        for pid, ch_list in src.children.items():
+            if pid in R:
+                kept = [cid for cid in ch_list if cid in S]
+                if kept:
+                    dst.children[pid] = kept
+        # Compute leaves as nodes in S with no child in S
+        leaves: set[str] = set()
+        for bid in S:
+            child_list = dst.children.get(bid, [])
+            if not child_list:
+                leaves.add(bid)
+        dst.leaves = leaves
+        dst.max_height = H_max
+        # leaves_by_height and blocks_by_height within window (and include hinge height H_cut-1 for P1)
+        dst.leaves_by_height = {}
+        dst.blocks_by_height = {}
+        for bid in R:
+            b = dst.blocks.get(bid)
+            if b is None:
+                continue
+            h = int(b.height)
+            # Record blocks_by_height for both S and P1
+            dst.blocks_by_height.setdefault(h, set()).add(bid)
+        for bid in dst.leaves:
+            h = int(dst.blocks[bid].height)
+            dst.leaves_by_height.setdefault(h, set()).add(bid)
+        # Timing/state maps: copy all times (small) for safety
         dst.first_seen_time_by_height = dict(src.first_seen_time_by_height)
-        dst.in_time_blocks = set(src.in_time_blocks)
         dst.block_first_seen = dict(src.block_first_seen)
-        dst.blocks_by_height = {h: set(bids) for h, bids in src.blocks_by_height.items()}
-        # Copy cumulative and step weights
-        dst.cum_block_weight = dict(src.cum_block_weight)
+        # In-time blocks limited to R
+        dst.in_time_blocks = {bid for bid in src.in_time_blocks if bid in R}
+        # Copy cumulative and step weights for R only
+        dst.cum_block_weight = {bid: w for bid, w in src.cum_block_weight.items() if bid in R}
         try:
-            dst.step_weight = dict(getattr(src, 'step_weight', {}))
+            dst.step_weight = {bid: w for bid, w in getattr(src, 'step_weight', {}).items() if bid in R}
         except Exception:
             pass
-        # Copy WS bookkeeping if present
+        # Copy WS bookkeeping for relevant parents/blocks only
         try:
-            dst.workshare_count_by_parent = dict(getattr(src, 'workshare_count_by_parent', {}))
-            dst._seen_workshare_ids = set(getattr(src, '_seen_workshare_ids', set()))
-            dst._ws_arrivals_by_parent = {k: list(v) for k, v in getattr(src, '_ws_arrivals_by_parent', {}).items()}
-            dst._ws_counted_by_block = {k: set(v) for k, v in getattr(src, '_ws_counted_by_block', {}).items()}
-            # New WS continuity caches
-            dst._ws_earliest_id_by_parent = {k: dict(v) for k, v in getattr(src, '_ws_earliest_id_by_parent', {}).items()}
-            dst._ws_contig_count_by_parent = dict(getattr(src, '_ws_contig_count_by_parent', {}))
-            dst._ws_arrival_time_by_id = dict(getattr(src, '_ws_arrival_time_by_id', {}))
+            dst.workshare_count_by_parent = {pid: v for pid, v in getattr(src, 'workshare_count_by_parent', {}).items() if pid in R}
+            dst._seen_workshare_ids = set()  # safe to reset in PRIVATE; duplicates won't replay there
+            dst._ws_arrivals_by_parent = {pid: list(v) for pid, v in getattr(src, '_ws_arrivals_by_parent', {}).items() if pid in R}
+            dst._ws_counted_by_block = {bid: set(v) for bid, v in getattr(src, '_ws_counted_by_block', {}).items() if bid in S}
+            # WS continuity caches
+            dst._ws_earliest_id_by_parent = {pid: dict(v) for pid, v in getattr(src, '_ws_earliest_id_by_parent', {}).items() if pid in R}
+            dst._ws_contig_count_by_parent = {pid: v for pid, v in getattr(src, '_ws_contig_count_by_parent', {}).items() if pid in R}
+            # Keep arrival times only for WS that correspond to parents in R or included ids in S
+            keep_ids: set[str] = set()
+            for pid, emap in dst._ws_earliest_id_by_parent.items():
+                for wsid in emap.values():
+                    keep_ids.add(wsid)
+            for bid in S:
+                bl = dst.blocks.get(bid)
+                if bl is not None:
+                    for wsid in getattr(bl, 'included_ws_ids', []) or []:
+                        keep_ids.add(wsid)
+            src_arrival = getattr(src, '_ws_arrival_time_by_id', {})
+            dst._ws_arrival_time_by_id = {wsid: t for wsid, t in src_arrival.items() if wsid in keep_ids}
         except Exception:
             pass
-        # Preserve selected head
+        # Preserve selected head (must be in S)
         dst.selected_head_id = src.selected_head_id
         # Preserve RNG state for random tie-breaking so CF matches continuation
         try:

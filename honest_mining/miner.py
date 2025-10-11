@@ -317,6 +317,9 @@ class Miner:
         h = block.height
         self.blocks_by_height.setdefault(h, set()).add(block.id)
 
+        # Prune old leaves far below the tip to keep head enumeration bounded
+        self._prune_old_leaves()
+
         # Use the earliest known first-seen time for this block (fallback to provided)
         t_recv = self.block_first_seen.get(block.id, received_time)
 
@@ -531,14 +534,24 @@ class Miner:
             return self._rng.choice(best)
 
     def _current_heads(self) -> List[Block]:
-        """Return blocks that have no known children (leaves)."""
-        # IMPORTANT: iterate leaves in a deterministic order. Sets have hash-dependent
-        # iteration order which can vary between runs (PYTHONHASHSEED). If we build
-        # candidate head lists from an unordered set, then subsequent random tie-breaks
-        # (even with a fixed RNG seed) can select different blocks because the list
-        # permutation changes across processes. Sorting by id stabilizes the ordering
-        # and ensures reproducible outcomes for a given seed.
-        return [self.blocks[bid] for bid in sorted(self.leaves)]
+        max_h = self.max_height
+        start_h = max(0, max_h - (2 * self.k))
+        ids: List[str] = []
+        for h in range(start_h, max_h + 1):
+            ids.extend(self.leaves_by_height.get(h, set()))
+        return [self.blocks[bid] for bid in sorted(ids)]
+
+    def _prune_old_leaves(self) -> None:
+        cutoff = max(0, int(self.max_height) - (2 * int(self.k)))
+        if cutoff <= 0:
+            return
+        # Remove leaves and their height-index entries below cutoff
+        to_drop_heights = [h for h in list(self.leaves_by_height.keys()) if int(h) < cutoff]
+        for h in to_drop_heights:
+            s = self.leaves_by_height.pop(h, None)
+            if s:
+                for bid in s:
+                    self.leaves.discard(bid)
 
 
     def _iter_path_from_head(self, head_id: str) -> List[Block]:
