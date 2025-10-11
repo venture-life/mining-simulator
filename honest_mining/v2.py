@@ -219,7 +219,7 @@ def simulate_mining_eventqV2(
             height=0,  # will be set by receiver based on local parent
             uncles=list(b.uncles),
             created_time=b.created_time,
-            ws_version=getattr(b, "ws_version", 0),
+            included_ws_ids=list(getattr(b, "included_ws_ids", []) or []),
         )
 
     # Helper: create a fresh WorkShare instance for delivery to a miner

@@ -219,9 +219,19 @@ class SelfishMiner:
                             continue
                         if sib_id in self.public.in_time_blocks:
                             uncles_pub.append(sib_id)
-                # Include ws_version from PUBLIC view counts at parent_pub
+                # Build included WS ids at mine time (PUBLIC view): earliest per version, continuous from v=0
                 N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-                ws_ver_pub = int(self.public.workshare_count_by_parent.get(parent_pub.id, 0)) if N > 1 else 0
+                included_pub: List[str] = []
+                if N > 1:
+                    arrs = sorted(getattr(self.public, '_ws_arrivals_by_parent', {}).get(parent_pub.id, []), key=lambda x: float(x[0]))
+                    earliest_by_ver: Dict[int, Tuple[float, str]] = {}
+                    for (t_ws, ws_id, ver) in arrs:
+                        if ver not in earliest_by_ver:
+                            earliest_by_ver[ver] = (t_ws, ws_id)
+                    v = 0
+                    while v in earliest_by_ver:
+                        included_pub.append(earliest_by_ver[v][1])
+                        v += 1
                 new_block_pub = Block(
                     id=new_id,
                     parent_id=parent_pub.id,
@@ -229,7 +239,7 @@ class SelfishMiner:
                     height=parent_pub.height + 1,
                     uncles=uncles_pub,
                     created_time=now,
-                    ws_version=ws_ver_pub,
+                    included_ws_ids=included_pub,
                 )
                 self._last_event = "mine"
                 self.last = 's0'
@@ -260,9 +270,21 @@ class SelfishMiner:
                         continue
                     if sib_id in self.public.in_time_blocks:
                         uncles_pub.append(sib_id)
-            # Include ws_version from PUBLIC view counts at parent_prv (private WS are not tracked network-wide)
+            # Build included WS ids using both PUBLIC known and PRIVATE withheld arrivals: earliest per version, continuous from v=0
             N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-            ws_ver_prv = int(self.public.workshare_count_by_parent.get(parent_prv.id, 0)) if N > 1 else 0
+            included_prv: List[str] = []
+            if N > 1:
+                arrs_pub = getattr(self.public, '_ws_arrivals_by_parent', {}).get(parent_prv.id, [])
+                arrs_prv = getattr(self.private, '_ws_arrivals_by_parent', {}).get(parent_prv.id, [])
+                arrs = sorted(list(arrs_pub) + list(arrs_prv), key=lambda x: float(x[0]))
+                earliest_by_ver: Dict[int, Tuple[float, str]] = {}
+                for (t_ws, ws_id, ver) in arrs:
+                    if ver not in earliest_by_ver:
+                        earliest_by_ver[ver] = (t_ws, ws_id)
+                v = 0
+                while v in earliest_by_ver:
+                    included_prv.append(earliest_by_ver[v][1])
+                    v += 1
             new_block = Block(
                 id=new_id,
                 parent_id=parent_prv.id,
@@ -270,7 +292,7 @@ class SelfishMiner:
                 height=parent_prv.height + 1,
                 uncles=uncles_pub,
                 created_time=now,
-                ws_version=ws_ver_prv,
+                included_ws_ids=included_prv,
             )
             # Receive locally into PRIVATE view only; do not broadcast yet
             self.private.on_receive(new_block, received_time=now)
@@ -542,7 +564,7 @@ class SelfishMiner:
                 height=b.height,
                 uncles=list(b.uncles),
                 created_time=b.created_time,
-                ws_version=getattr(b, "ws_version", 0),
+                included_ws_ids=list(getattr(b, "included_ws_ids", []) or []),
             )
         # Shallow-copy id structures (ids refer to dst.blocks keys)
         dst.children = {pid: list(ch) for pid, ch in src.children.items()}
@@ -590,7 +612,7 @@ class SelfishMiner:
             height=0,  # receiver will derive
             uncles=list(b.uncles),
             created_time=b.created_time,
-            ws_version=getattr(b, "ws_version", 0),
+            included_ws_ids=list(getattr(b, "included_ws_ids", []) or []),
         )
 
     

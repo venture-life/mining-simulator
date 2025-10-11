@@ -27,8 +27,8 @@ class Block:
     height: int = 0
     uncles: List[str] = field(default_factory=list)
     created_time: float = 0.0
-    # When work_shares > 1: number of work-shares the producer claims to include for this block's parent
-    ws_version: int = 0
+    # Explicit list of work-share ids the producer includes for this block (same parent). Treated as a set.
+    included_ws_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,8 +130,9 @@ class Miner:
         # - _seen_workshare_ids: de-dup set by work-share id to ignore exact duplicates.
         self.workshare_count_by_parent: Dict[str, int] = {}
         self._seen_workshare_ids: Set[str] = set()
-        # WS arrival times by parent, for initial block weight; and per-block counted WS ids
-        self._ws_arrivals_by_parent: Dict[str, List[Tuple[float, str]]] = {}
+        # WS arrival tuples by parent: (arrival_time, ws_id, version)
+        # Used to build included_ws_ids at mine-time and to evaluate pre-block/late WS inclusion
+        self._ws_arrivals_by_parent: Dict[str, List[Tuple[float, str, int]]] = {}
         self._ws_counted_by_block: Dict[str, Set[str]] = {}
 
         # Genesis
@@ -208,8 +209,18 @@ class Miner:
                     if sib_id in self.in_time_blocks:
                         uncles.append(sib_id)
 
-            # Capture WS include count at mining time for this parent (as claimed by producer)
-            ws_ver = int(self.workshare_count_by_parent.get(parent.id, 0)) if N > 1 else 0
+            # Build included WS set at mine time: earliest per version, continuous from v=0
+            included_ids: List[str] = []
+            if N > 1:
+                arrs = sorted(self._ws_arrivals_by_parent.get(parent.id, []), key=lambda x: float(x[0]))
+                earliest_by_ver: Dict[int, Tuple[float, str]] = {}
+                for (t_ws, ws_id, ver) in arrs:
+                    if ver not in earliest_by_ver:
+                        earliest_by_ver[ver] = (t_ws, ws_id)
+                v = 0
+                while v in earliest_by_ver:
+                    included_ids.append(earliest_by_ver[v][1])
+                    v += 1
             new_block = Block(
                 id=new_id,
                 parent_id=parent.id,
@@ -217,7 +228,7 @@ class Miner:
                 height=parent.height + 1,
                 uncles=uncles,
                 created_time=now,
-                ws_version=ws_ver,
+                included_ws_ids=included_ids,
             )
             return new_block
 
@@ -242,7 +253,7 @@ class Miner:
         v = int(getattr(ws, "version", 0) or 0)
         self.workshare_count_by_parent[pid] = max(cur_next, v + 1)
         # Record arrival for future blocks referencing this parent
-        self._ws_arrivals_by_parent.setdefault(pid, []).append((received_time, ws.id))
+        self._ws_arrivals_by_parent.setdefault(pid, []).append((received_time, ws.id, v))
         # If WS-based weighting is enabled (N>1), apply late WS within tau to eligible child blocks
         if self.work_shares and int(self.work_shares) > 1:
             base = 1.0 / float(int(self.work_shares))
@@ -253,13 +264,13 @@ class Miner:
                 t_block = self.block_first_seen.get(bid)
                 if t_block is None:
                     continue
-                # Include WS if it arrives within [t_block, t_block + tau] AND the child block is in-time
-                if (received_time >= t_block) and (received_time <= t_block + self.tau) and (bid in self.in_time_blocks):
+                # Include WS late only if child is in-time, WS is explicitly included in that block, and within [t_block, t_block + tau]
+                blk_obj = self.blocks.get(bid)
+                if blk_obj is None:
+                    continue
+                if (received_time >= t_block) and (received_time <= t_block + self.tau) and (bid in self.in_time_blocks) and (ws.id in getattr(blk_obj, "included_ws_ids", [])):
                     counted = self._ws_counted_by_block.setdefault(bid, set())
-                    # Respect producer-declared cap for this block
-                    blk_obj = self.blocks.get(bid)
-                    cap = int(getattr(blk_obj, "ws_version", 0) or 0) if blk_obj is not None else 0
-                    if (ws.id not in counted) and (len(counted) < cap):
+                    if (ws.id not in counted):
                         counted.add(ws.id)
                         self.step_weight[bid] = float(self.step_weight.get(bid, 0.0)) + base
                         self._propagate_weight_delta_from(bid, base)
@@ -337,16 +348,14 @@ class Miner:
                 step_w = base
                 pid = block.parent_id or "GENESIS"
                 counted = self._ws_counted_by_block.setdefault(block.id, set())
-                # Respect block's declared include cap
-                cap = int(getattr(block, "ws_version", 0) or 0)
-                # Include any WS that arrived before this block, up to cap
-                arrs = sorted(self._ws_arrivals_by_parent.get(pid, []), key=lambda x: float(x[0]))
-                for (t_ws, ws_id) in arrs:
-                    if len(counted) >= cap:
-                        break
-                    if t_ws <= t_recv and ws_id not in counted:
-                        step_w += base
-                        counted.add(ws_id)
+                included: Set[str] = set(getattr(block, "included_ws_ids", []) or [])
+                if included:
+                    # Count only those included WS that arrived before this block
+                    arrs = sorted(self._ws_arrivals_by_parent.get(pid, []), key=lambda x: float(x[0]))
+                    for (t_ws, ws_id, _ver) in arrs:
+                        if ws_id in included and t_ws <= t_recv and ws_id not in counted:
+                            step_w += base
+                            counted.add(ws_id)
                 self.step_weight[block.id] = float(step_w)
             else:
                 # Late block at this height contributes zero weight in WS mode
