@@ -134,6 +134,13 @@ class Miner:
         # Used to build included_ws_ids at mine-time and to evaluate pre-block/late WS inclusion
         self._ws_arrivals_by_parent: Dict[str, List[Tuple[float, str, int]]] = {}
         self._ws_counted_by_block: Dict[str, Set[str]] = {}
+        # WS continuity caches to avoid repeated scans/sorts
+        # - _ws_earliest_id_by_parent[pid][ver] = first-seen ws_id for that version
+        # - _ws_contig_count_by_parent[pid] = largest m such that versions [0..m-1] are all present
+        # - _ws_arrival_time_by_id[ws_id] = local delivery time for fast cutoff checks
+        self._ws_earliest_id_by_parent: Dict[str, Dict[int, str]] = {}
+        self._ws_contig_count_by_parent: Dict[str, int] = {}
+        self._ws_arrival_time_by_id: Dict[str, float] = {}
 
         # Genesis
         genesis = Block(id=genesis_id, parent_id=None, miner_id=None, height=0, uncles=[], created_time=0.0)
@@ -189,34 +196,14 @@ class Miner:
         Do not deliver to self here; the simulator will schedule deliveries (including to self
         with a tiny epsilon delay) via its event queue.
         """
-        parent = self._select_head()
-        # In WS-mode, choose between the current head and its parent to maximize immediate post-block cumulative weight
         N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-        if N > 1:
-            candidates: List[Block] = [parent]
-            if parent.parent_id is not None:
-                par = self.blocks.get(parent.parent_id)
-                if par is not None:
-                    candidates.append(par)
-            # Evaluate prospective cumulative weight if we mine a block on each candidate
-            best_val = None
-            best_cands: List[Block] = []
-            for cand in candidates:
-                step = self._prospective_step_if_mined_on(cand, now)
-                prospective = float(self.cum_block_weight.get(cand.id, 0.0)) + float(step)
-                if (best_val is None) or (prospective > best_val):
-                    best_val = prospective
-                    best_cands = [cand]
-                elif prospective == best_val:
-                    best_cands.append(cand)
-            if best_cands:
-                # Rule 3: choose uniformly in WS-mode on tie
-                parent = self._rng.choice(best_cands) if len(best_cands) > 1 else best_cands[0]
+        is_block = (N <= 1) or (self._rng.random() <= (1.0 / float(N)))
+        # Choose parent once, WS-aware when mining a work-share
+        parent = self.choose_parent_to_mine_upon(now, for_workshare=(N > 1 and not is_block))
         # Track the selected parent head at the time of mining
         self.selected_head_id = parent.id
 
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-        if N <= 1 or self._rng.random() <= (1.0 / float(N)):
+        if is_block:
             # Produce a real block (legacy path)
             new_id = f"{self.miner_id}:{self._next_seq}"
             self._next_seq += 1
@@ -246,38 +233,13 @@ class Miner:
             )
             return new_block
 
-        # Produce a work-share for the current parent
+        # Produce a work-share for the selected parent (WS-mode)
         if N > 1:
-            # Re-evaluate parent for WS placement: add marginal +base if WS extends contiguous prefix now
-            candidates: List[Block] = [parent]
-            if parent.parent_id is not None:
-                par = self.blocks.get(parent.parent_id)
-                if par is not None:
-                    candidates.append(par)
-            best_val = None
-            best_cands: List[Block] = []
-            base = 1.0 / float(N)
-            for cand in candidates:
-                step = self._prospective_step_if_mined_on(cand, now)
-                if self._is_in_time(int(cand.height) + 1, now):
-                    cnt, _ = self._continuous_ws_for_parent(cand.id, now)
-                    next_ver = int(self.workshare_count_by_parent.get(cand.id, 0))
-                    if next_ver == cnt:
-                        step += base
-                prospective = float(self.cum_block_weight.get(cand.id, 0.0)) + float(step)
-                if (best_val is None) or (prospective > best_val):
-                    best_val = prospective
-                    best_cands = [cand]
-                elif prospective == best_val:
-                    best_cands.append(cand)
-            if best_cands:
-                parent = self._rng.choice(best_cands) if len(best_cands) > 1 else best_cands[0]
-                self.selected_head_id = parent.id
-        pid = parent.id
-        cur = self.workshare_count_by_parent.get(pid, 0)
-        ws_id = f"WS:{self.miner_id}:{pid}:{cur}"
-        ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=cur, created_time=now)
-        return ws
+            pid = parent.id
+            cur = self.workshare_count_by_parent.get(pid, 0)
+            ws_id = f"WS:{self.miner_id}:{pid}:{cur}"
+            ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=cur, created_time=now)
+            return ws
 
     def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
         """
@@ -294,6 +256,16 @@ class Miner:
         self.workshare_count_by_parent[pid] = max(cur_next, v + 1)
         # Record arrival for future blocks referencing this parent
         self._ws_arrivals_by_parent.setdefault(pid, []).append((received_time, ws.id, v))
+        self._ws_arrival_time_by_id[ws.id] = float(received_time)
+        # Update earliest-per-version cache and contiguous count for this parent
+        emap = self._ws_earliest_id_by_parent.setdefault(pid, {})
+        if v not in emap:
+            emap[v] = ws.id
+        # Increment contiguous count while next version exists
+        cur_cc = int(self._ws_contig_count_by_parent.get(pid, 0))
+        while emap.get(cur_cc) is not None:
+            cur_cc += 1
+        self._ws_contig_count_by_parent[pid] = cur_cc
         # If WS-based weighting is enabled (N>1), apply late WS within tau to eligible child blocks
         if self.work_shares and int(self.work_shares) > 1:
             changed = self._apply_late_ws_to_children(ws, received_time)
@@ -385,18 +357,25 @@ class Miner:
         return (t0 is None) or ((float(at_time) - float(t0)) <= self.tau)
 
     def _continuous_ws_for_parent(self, parent_id: str, cutoff_time: Optional[float]) -> Tuple[int, List[str]]:
-        """Return (count, ids) of earliest-per-version WS for parent_id up to cutoff_time, continuous from v=0."""
+        """Return (count, ids) of earliest-per-version WS for parent_id up to cutoff_time, continuous from v=0.
+
+        Note: We maintain earliest-per-version incrementally at delivery time; thus, all cached
+        entries reflect WS whose arrival time <= now. For callers passing `cutoff_time`=now, this
+        is equivalent to filtering by time.
+        """
+        emap = self._ws_earliest_id_by_parent.get(parent_id, {})
+        cc = int(self._ws_contig_count_by_parent.get(parent_id, 0))
         ids: List[str] = []
-        arrs = sorted(self._ws_arrivals_by_parent.get(parent_id, []), key=lambda x: float(x[0]))
-        earliest_by_ver: Dict[int, str] = {}
-        for (t_ws, ws_id, ver) in arrs:
-            if (cutoff_time is None) or (float(t_ws) <= float(cutoff_time)):
-                if ver not in earliest_by_ver:
-                    earliest_by_ver[ver] = ws_id
-        v = 0
-        while v in earliest_by_ver:
-            ids.append(earliest_by_ver[v])
-            v += 1
+        for v in range(cc):
+            wsid = emap.get(v)
+            if wsid is None:
+                break
+            # If a historical cutoff_time earlier than arrival is requested, skip (rare case)
+            if (cutoff_time is not None):
+                t_ws = self._ws_arrival_time_by_id.get(wsid)
+                if t_ws is None or float(t_ws) > float(cutoff_time):
+                    break
+            ids.append(wsid)
         return (len(ids), ids)
 
     def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
@@ -411,6 +390,42 @@ class Miner:
         base = 1.0 / float(N)
         return float(base + base * float(cnt))
 
+    def choose_parent_to_mine_upon(self, now: float, for_workshare: bool = False) -> Block:
+        """WS-aware parent selection between current head and its parent.
+
+        - Maximizes immediate prospective cumulative weight if we mine on the candidate now.
+        - When for_workshare=True and N>1, adds a marginal +base if the new WS would extend
+          the contiguous prefix for that parent at time now.
+        - On ties, prefers the current head to avoid self-forks.
+        """
+        parent = self._select_head()
+        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        if N > 1 and parent is not None:
+            candidates: List[Block] = [parent]
+            if parent.parent_id is not None:
+                par = self.blocks.get(parent.parent_id)
+                if par is not None:
+                    candidates.append(par)
+            best_val = None
+            best_cands: List[Block] = []
+            base = 1.0 / float(N)
+            for cand in candidates:
+                step = self._prospective_step_if_mined_on(cand, now)
+                if for_workshare and self._is_in_time(int(cand.height) + 1, now):
+                    cnt, _ = self._continuous_ws_for_parent(cand.id, now)
+                    next_ver = int(self.workshare_count_by_parent.get(cand.id, 0))
+                    if next_ver == cnt:
+                        step += base
+                prospective = float(self.cum_block_weight.get(cand.id, 0.0)) + float(step)
+                if (best_val is None) or (prospective > best_val):
+                    best_val = prospective
+                    best_cands = [cand]
+                elif prospective == best_val:
+                    best_cands.append(cand)
+            if best_cands:
+                parent = best_cands[0]
+        return parent
+
     def _initial_step_weight_for_block(self, block: Block, t_recv: float) -> float:
         """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set."""
         N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
@@ -422,9 +437,10 @@ class Miner:
         included: Set[str] = set(getattr(block, "included_ws_ids", []) or [])
         if included:
             counted = self._ws_counted_by_block.setdefault(block.id, set())
-            arrs = sorted(self._ws_arrivals_by_parent.get(pid, []), key=lambda x: float(x[0]))
-            for (t_ws, ws_id, _ver) in arrs:
-                if ws_id in included and float(t_ws) <= float(t_recv) and (ws_id not in counted):
+            # Count only included WS that arrived before this block
+            for ws_id in list(included):
+                t_ws = self._ws_arrival_time_by_id.get(ws_id)
+                if (t_ws is not None) and (float(t_ws) <= float(t_recv)) and (ws_id not in counted):
                     step_w += base
                     counted.add(ws_id)
         return float(step_w)

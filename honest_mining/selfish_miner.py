@@ -211,8 +211,10 @@ class SelfishMiner:
             if is_block:
                 new_id = f"{self.miner_id}:{self._next_seq}"
                 self._next_seq += 1
+                # Skip uncle scans in WS-mode (no weight effect); compute only in blocks-only mode
+                N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
                 uncles_pub: List[str] = []
-                if parent_pub.parent_id is not None:
+                if N <= 1 and parent_pub.parent_id is not None:
                     gp = parent_pub.parent_id
                     for sib_id in self.public.children.get(gp, []):
                         if sib_id == parent_pub.id:
@@ -220,7 +222,6 @@ class SelfishMiner:
                         if sib_id in self.public.in_time_blocks:
                             uncles_pub.append(sib_id)
                 # Build included WS ids at mine time (PUBLIC view) via helper: earliest per version, continuous from v=0
-                N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
                 included_pub: List[str] = []
                 if N > 1:
                     _cnt, included_pub = self.public._continuous_ws_for_parent(parent_pub.id, now)
@@ -253,9 +254,10 @@ class SelfishMiner:
             parent_prv = self.choose_parent_to_mine_upon(now)
             new_id = f"{self.miner_id}:{self._next_seq}"
             self._next_seq += 1
-            # Determine uncles from PUBLIC view for reference
+            # Determine uncles from PUBLIC view for reference (skip in WS-mode for perf)
+            N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
             uncles_pub: List[str] = []
-            if parent_prv.parent_id is not None:
+            if N <= 1 and parent_prv.parent_id is not None:
                 gp = parent_prv.parent_id
                 for sib_id in self.public.children.get(gp, []):
                     if sib_id == parent_prv.id:
@@ -263,7 +265,6 @@ class SelfishMiner:
                     if sib_id in self.public.in_time_blocks:
                         uncles_pub.append(sib_id)
             # Build included WS ids from PRIVATE view via helper (PRIVATE ingests withheld + public WS for known parents)
-            N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
             included_prv: List[str] = []
             if N > 1:
                 _cnt, included_prv = self.private._continuous_ws_for_parent(parent_prv.id, now)
@@ -381,7 +382,8 @@ class SelfishMiner:
                 elif prospective == best_val:
                     best_cands.append(cand)
             if best_cands:
-                parent = self._rng.choice(best_cands) if len(best_cands) > 1 else best_cands[0]
+                # Prefer the existing PRIVATE head deterministically on tie to avoid self-forks
+                parent = best_cands[0]
 
         return parent
 
@@ -474,6 +476,24 @@ class SelfishMiner:
         if self._pending_release:
             item = self._pending_release.pop(0)
             if isinstance(item, Block):
+                # In WS-mode, uncles were skipped at mine time; fill them lazily at publish for metrics
+                try:
+                    N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+                except Exception:
+                    N = 1
+                if N > 1 and not item.uncles:
+                    pid = item.parent_id
+                    uncles_pub: List[str] = []
+                    if pid is not None:
+                        par_b = self.public.blocks.get(pid)
+                        if par_b is not None and par_b.parent_id is not None:
+                            gp = par_b.parent_id
+                            for sib_id in self.public.children.get(gp, []):
+                                if sib_id == pid:
+                                    continue
+                                if sib_id in self.public.in_time_blocks:
+                                    uncles_pub.append(sib_id)
+                    item.uncles = uncles_pub
                 # Do not deliver to self here; simulator will broadcast (including self) with epsilon
                 self.published += 1
             return item
@@ -564,18 +584,8 @@ class SelfishMiner:
             tie_break_seed=getattr(src, 'tie_break_seed', None),
             work_shares=getattr(src, 'work_shares', 1),
         )
-        # Clone blocks (dataclass) by value
-        dst.blocks = {}
-        for bid, b in src.blocks.items():
-            dst.blocks[bid] = Block(
-                id=b.id,
-                parent_id=b.parent_id,
-                miner_id=b.miner_id,
-                height=b.height,
-                uncles=list(b.uncles),
-                created_time=b.created_time,
-                included_ws_ids=list(getattr(b, "included_ws_ids", []) or []),
-            )
+        # Share Block objects by reference (Blocks are immutable post-receive)
+        dst.blocks = {bid: b for bid, b in src.blocks.items()}
         # Shallow-copy id structures (ids refer to dst.blocks keys)
         dst.children = {pid: list(ch) for pid, ch in src.children.items()}
         dst.leaves = set(src.leaves)
@@ -599,6 +609,10 @@ class SelfishMiner:
             dst._seen_workshare_ids = set(getattr(src, '_seen_workshare_ids', set()))
             dst._ws_arrivals_by_parent = {k: list(v) for k, v in getattr(src, '_ws_arrivals_by_parent', {}).items()}
             dst._ws_counted_by_block = {k: set(v) for k, v in getattr(src, '_ws_counted_by_block', {}).items()}
+            # New WS continuity caches
+            dst._ws_earliest_id_by_parent = {k: dict(v) for k, v in getattr(src, '_ws_earliest_id_by_parent', {}).items()}
+            dst._ws_contig_count_by_parent = dict(getattr(src, '_ws_contig_count_by_parent', {}))
+            dst._ws_arrival_time_by_id = dict(getattr(src, '_ws_arrival_time_by_id', {}))
         except Exception:
             pass
         # Preserve selected head
