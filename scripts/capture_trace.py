@@ -23,29 +23,38 @@ CONTEXT_PATH = os.path.join(OUTPUT_DIR, "trace_context.json")
 def run_and_capture() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Run the simulator with the requested parameters and return (trace, meta)."""
     # Parameters from the user request
-    steps = 400
+    steps = 500
     groups = 5
     attacker_share = 0.4
-    k = 1
-    window = 0.0  # tau
+    k = 3
+    window = 5.0  # tau
     seed = 215
+    work_shares = 16
+    random_tie_break = False
 
-    # We explicitly set deterministic_selection=False to match --random-tie-break
+    # CLI parity:
+    # - Lambda_eff = rate * work_shares (default rate = 1/120)
+    # - deterministic tie-break by default (unless --random-tie-break is requested)
+    # - track_times enabled to match --track-times
+    rate = 1.0 / 120.0
+    Lambda_eff = rate * work_shares
     res = simulate_mining_eventqV2(
         steps=steps,
         groups=groups,
         shares=None,
-        Lambda=1.0 / 120.0,
+        Lambda=Lambda_eff,
         D=window,
         max_prop_delay=2.5,
         k=k,
-        deterministic_selection=False,
+        deterministic_selection=(not random_tie_break),
         seed=seed,
-        track_times=False,
+        track_times=True,
+        time_bins=50,
         trace=True,
         trace_limit=None,
         attacker_share=attacker_share,
         selfish_policy=None,
+        work_shares=work_shares,
     )
 
     trace = res.trace or []
@@ -53,24 +62,25 @@ def run_and_capture() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return trace, meta
 
 
-def find_sequence(trace: List[Dict[str, Any]], deliver_height: int = 97, miner_id: int = 0) -> Dict[str, Any]:
-    """Find the first DELIVER to miner `miner_id` at height `deliver_height` and the next MINE by that miner.
+def finde_sequence(trace: List[Dict[str, Any]], deliver_only: bool, miner_id: int) -> Dict[str, Any]:
+    """Build a miner-specific event context from the trace.
 
-    Returns a dictionary with indices and event snippets for context.
+    - When deliver_only is True:
+      deliver_context = all events of type {DELIVER, DELIVER_WS} with `to == miner_id` across the entire trace;
+      mine_context = [].
+
+    - When deliver_only is False:
+      deliver_context = a local slice around the first delivery (DELIVER or DELIVER_WS) to `miner_id`;
+      mine_context = the next MINE by `miner_id` after that delivery, with a local slice for context when present.
     """
     deliver_idx: Optional[int] = None
     for i, ev in enumerate(trace):
-        if ev.get("type") == "DELIVER" and int(ev.get("to", -1)) == miner_id:
-            try:
-                h = int(ev.get("height"))
-            except Exception:
-                continue
-            if h == deliver_height:
-                deliver_idx = i
-                break
+        if ev.get("type") in ("DELIVER", "DELIVER_WS") and int(ev.get("to", -1)) == miner_id:
+            deliver_idx = i
+            break
 
     mine_idx: Optional[int] = None
-    if deliver_idx is not None:
+    if (deliver_idx is not None) and (not deliver_only):
         for j in range(deliver_idx + 1, len(trace)):
             ev = trace[j]
             if ev.get("type") == "MINE" and int(ev.get("miner", -1)) == miner_id:
@@ -93,8 +103,15 @@ def find_sequence(trace: List[Dict[str, Any]], deliver_height: int = 97, miner_i
         return trace[lo:hi]
 
     if deliver_idx is not None:
-        ctx["deliver_context"] = slice_ctx(deliver_idx)
-    if mine_idx is not None:
+        if deliver_only:
+            # Collect the entire filtered list of deliveries to miner_id across the whole trace
+            ctx["deliver_context"] = [
+                e for e in trace
+                if (e.get("type") in ("DELIVER", "DELIVER_WS")) and (int(e.get("to", -1)) == miner_id)
+            ]
+        else:
+            ctx["deliver_context"] = slice_ctx(deliver_idx)
+    if (mine_idx is not None) and (not deliver_only):
         ctx["mine_context"] = slice_ctx(mine_idx)
 
     # Add a short diagnosis if we can compute parent height from the MINE event
@@ -112,6 +129,7 @@ def find_sequence(trace: List[Dict[str, Any]], deliver_height: int = 97, miner_i
             "new_block_height": new_h,
             "parent_id": me.get("parent_id"),
             "inferred_parent_height": parent_h,
+            "ws_included_mine": me.get("ws_included"),
         })
     if deliver_idx is not None:
         de = trace[deliver_idx]
@@ -120,6 +138,7 @@ def find_sequence(trace: List[Dict[str, Any]], deliver_height: int = 97, miner_i
             "delivered_block_id": de.get("block_id"),
             "delivered_height": de.get("height"),
             "delivered_parent_id": de.get("parent_id"),
+            "ws_included_deliver": de.get("ws_included"),
         })
     ctx["diagnosis"] = diagnosis
 
@@ -136,13 +155,15 @@ def main() -> None:
         json.dump(trace, f, indent=2)
     print(f"Saved full trace to: {TRACE_PATH} with {len(trace)} events")
 
-    # Find the requested sequence: miner[0] receives height 97, then next MINE by miner[0]
-    ctx = find_sequence(trace, deliver_height=97, miner_id=0)
+    # Find the requested sequence per miner; when deliver_only=True, filter to deliveries to miner[0]
+    ctx = finde_sequence(trace, deliver_only=True, miner_id=5)
 
-    # Save context slice
+    # Save context slice (drop full trace from meta for compact context)
+    meta_lite = dict(meta)
+    meta_lite.pop("trace", None)
     with open(CONTEXT_PATH, "w", encoding="utf-8") as f:
         json.dump({
-            "meta": meta,
+            "meta": meta_lite,
             "sequence_context": ctx,
         }, f, indent=2)
     print(f"Saved context slice to: {CONTEXT_PATH}")
@@ -151,10 +172,7 @@ def main() -> None:
     diag = ctx.get("diagnosis", {})
     print("\nDiagnosis (concise):")
     print(json.dumps(diag, indent=2))
-    if ctx.get("deliver_idx") is None:
-        print("Note: No DELIVER to miner 0 at height 97 was found in this run.")
-    elif ctx.get("mine_idx") is None:
-        print("Note: No subsequent MINE by miner 0 after the height-97 delivery was found.")
+
 
 
 if __name__ == "__main__":

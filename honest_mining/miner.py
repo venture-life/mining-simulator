@@ -196,7 +196,7 @@ class Miner:
         Do not deliver to self here; the simulator will schedule deliveries (including to self
         with a tiny epsilon delay) via its event queue.
         """
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
         is_block = (N <= 1) or (self._rng.random() <= (1.0 / float(N)))
         # Choose parent once, WS-aware when mining a work-share
         parent = self.choose_parent_to_mine_upon(now, for_workshare=(N > 1 and not is_block))
@@ -383,7 +383,7 @@ class Miner:
 
     def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
         """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode."""
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
         if N <= 1:
             return 1.0
         h_new = int(cand.height) + 1
@@ -402,7 +402,7 @@ class Miner:
         - On ties, prefers the current head to avoid self-forks.
         """
         parent = self._select_head()
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
         if N > 1 and parent is not None:
             candidates: List[Block] = [parent]
             if parent.parent_id is not None:
@@ -431,7 +431,7 @@ class Miner:
 
     def _initial_step_weight_for_block(self, block: Block, t_recv: float) -> float:
         """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set."""
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
         base = 1.0 / float(N)
         if block.id not in self.in_time_blocks:
             return 0.0
@@ -451,8 +451,8 @@ class Miner:
     def _apply_late_ws_to_children(self, ws: WorkShare, received_time: float) -> bool:
         """Apply late WS within tau to eligible child blocks; returns True if any weights changed."""
         pid = ws.parent_id or "GENESIS"
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-        base = 1.0 / float(max(1, N))
+        N = self.work_shares
+        base = 1.0 / float(N)
         changed = False
         for bid in list(self.children.get(pid, [])):
             if bid not in self.blocks:

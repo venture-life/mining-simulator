@@ -418,6 +418,7 @@ def simulate_mining_eventqV2(
                         "height": new_obj.height,
                         "weight": miners[gi].cum_block_weight.get(new_obj.id, None),
                         "uncles": list(new_obj.uncles) if getattr(new_obj, "uncles", None) else [],
+                        "ws_included": len(getattr(new_obj, "included_ws_ids", []) or []),
                     })
                 _broadcast_workobject(new_obj, gi, t)
             elif isinstance(new_obj, WorkShare):
@@ -448,6 +449,7 @@ def simulate_mining_eventqV2(
                                 # Use PRIVATE view weight at mine time
                                 "weight": getattr(miners[gi], "private").cum_block_weight.get(b.id, None),
                                 "uncles": list(getattr(b, "uncles", []) or []),
+                                "ws_included": len(getattr(b, "included_ws_ids", []) or []),
                             })
                     except Exception:
                         pass
@@ -497,6 +499,7 @@ def simulate_mining_eventqV2(
                             # Receiver-local metrics after delivery
                             "height": m.blocks[blk.id].height,
                             "weight": m.cum_block_weight.get(blk.id, None),
+                            "ws_included": len(getattr(blk, "included_ws_ids", []) or []),
                         })
                 elif isinstance(obj, WorkShare):
                     ws = obj

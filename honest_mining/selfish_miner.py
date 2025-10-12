@@ -77,6 +77,7 @@ class SelfishMiner:
 
         # Local sequence for ids when crafting blocks directly (if needed later)
         self._next_seq = 0
+        self._now_time: float = 0.0
 
         # Queue of withheld blocks (kept only in private view until published)
         self._withheld: List[Block] = []
@@ -159,6 +160,7 @@ class SelfishMiner:
             return
 
         self.public.on_receive(block, received_time)
+        self._now_time = float(received_time)
         
         self._last_event = "receive"
         self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
@@ -184,6 +186,7 @@ class SelfishMiner:
         versioning semantics when interoperability is needed.
         """
         self.public.on_receive_workshare(ws, received_time)
+        self._now_time = float(received_time)
         # If PRIVATE aliases PUBLIC, the PUBLIC update already applied; avoid double-processing
         if (not self._private_alias) and (ws.parent_id in self.private.blocks):
             self.private.on_receive_workshare(ws, received_time)
@@ -206,7 +209,8 @@ class SelfishMiner:
         whether to publish another withheld block.
         """
         # Decide Block vs WorkShare
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
+        self._now_time = float(now)
         is_block = (N <= 1) or (self._rng.random() <= (1.0 / float(N)))
 
         # Burn-out: honest-like behavior on PUBLIC head
@@ -216,7 +220,6 @@ class SelfishMiner:
                 new_id = f"{self.miner_id}:{self._next_seq}"
                 self._next_seq += 1
                 # Skip uncle scans in WS-mode (no weight effect); compute only in blocks-only mode
-                N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
                 uncles_pub: List[str] = []
                 if N <= 1 and parent_pub.parent_id is not None:
                     gp = parent_pub.parent_id
@@ -259,7 +262,6 @@ class SelfishMiner:
             new_id = f"{self.miner_id}:{self._next_seq}"
             self._next_seq += 1
             # Determine uncles from PUBLIC view for reference (skip in WS-mode for perf)
-            N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
             uncles_pub: List[str] = []
             if N <= 1 and parent_prv.parent_id is not None:
                 gp = parent_prv.parent_id
@@ -303,6 +305,7 @@ class SelfishMiner:
             self._withheld_ws_by_parent.setdefault(pid, []).append(ws)
             self._ensure_private_materialized()
             self.private.on_receive_workshare(ws, received_time=now)
+            self.lead = self.get_lead()
 
             self._last_event = "mine"
             self.last = 's0'
@@ -363,7 +366,7 @@ class SelfishMiner:
 
         # WS-aware selection: compare PRIVATE head vs its parent using Miner helper to maximize immediate post-block cumulative weight.
         # If selecting for a work-share, also add marginal +base when the new WS would extend the contiguous prefix at now.
-        N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
+        N = self.work_shares
         if N > 1 and parent is not None:
             candidates: List[Block] = [parent]
             if parent.parent_id is not None:
@@ -393,13 +396,57 @@ class SelfishMiner:
         return parent
 
 
-    def get_lead(self) -> int:
-        """Return private_head_height - public_head_height."""
+    def get_lead(self, now: Optional[float] = None) -> int:
+        """
+        Return the height lead (private_head_height - public_head_height) and update diff_w.
+
+        Side effect
+        ----------
+        - Sets `self.diff_w` to the time-aware effective weight difference between the private
+          and public suffixes since their LCA at time `now` (or the last event time):
+            diff_w = sum_private_step_weights_that_are_still_in_time(now) - sum_public_step_weights
+          where private suffix steps are counted only if `public._is_in_time(height, now)` is True.
+
+        Parameters
+        ----------
+        now : Optional[float]
+            Evaluation time. If None, uses `self._now_time` maintained by events.
+        """
         pub_head = self.public.blocks[self.public.selected_head_id]
         prv_head = self.private.blocks[self.private.selected_head_id]
 
-        self.diff_w = self.private.cum_block_weight.get(self.private.selected_head_id, 0) - self.public.cum_block_weight.get(self.public.selected_head_id, 0)
-        return int(prv_head.height) - int(pub_head.height)        
+        t_now = float(now if now is not None else getattr(self, "_now_time", 0.0))
+        # Build public path and locate LCA with the private head, then take suffixes.
+        pub_path = self.public._iter_path_from_head(pub_head.id)
+        pub_ids_set = set(b.id for b in pub_path)
+        prv_suffix_rev: List[str] = []
+        cur = prv_head
+        while cur is not None and cur.id not in pub_ids_set:
+            prv_suffix_rev.append(cur.id)
+            if cur.parent_id is None:
+                break
+            cur = self.private.blocks.get(cur.parent_id)
+        lca_id = cur.id if (cur is not None and cur.id in pub_ids_set) else (pub_path[0].id if pub_path else self.public.selected_head_id)
+        idx_map = {b.id: i for i, b in enumerate(pub_path)}
+        lca_idx = idx_map.get(lca_id, -1)
+        pub_suffix_ids = [b.id for b in pub_path[lca_idx + 1:]] if lca_idx >= 0 else [b.id for b in pub_path]
+        prv_suffix_ids = list(reversed(prv_suffix_rev))
+
+        w_pub = 0.0
+        for bid in pub_suffix_ids:
+            w_pub += float(self.public.step_weight.get(bid, 0.0))
+
+        w_prv_eff = 0.0
+        for bid in prv_suffix_ids:
+            blk = self.private.blocks.get(bid)
+            if blk is None:
+                continue
+            h = int(getattr(blk, "height", 0) or 0)
+            # Count private step weight only if it would still be in-time at t_now.
+            if self.public._is_in_time(h, t_now):
+                w_prv_eff += float(self.private.step_weight.get(bid, 0.0))
+        self.diff_w = float(w_prv_eff - w_pub)
+        return int(prv_head.height) - int(pub_head.height)
 
 
     def act(self, now: float) -> Optional[Union[Block, WorkShare]]:
@@ -416,7 +463,7 @@ class SelfishMiner:
             When publishing, this returns either the next withheld Block or one of its
             associated WorkShares as the release queue drains. Otherwise, returns None.
         """
-
+        N = self.work_shares
         # If we have a pending release batch (block and its WS), prioritize publishing.
         if self._pending_release:
             decision = 1
@@ -436,7 +483,7 @@ class SelfishMiner:
         # Default SM1 behaviour if no decider is provided
         # we found a block (s0), or get a callback when we recently broadcasted one (s1)
         elif self.last == "s0" or self.last == "s1":
-            if self.lead == 1 and self.last == "s1":
+            if (N > 1 and self.last == "s1" and float(self.diff_w) == 1.0 / float(N)) or (N <= 1 and self.lead == 1 and self.last == "s1"):
                 if self._withheld:
                     decision = 1
                 else:
@@ -444,23 +491,10 @@ class SelfishMiner:
             else:
                 decision = 0
         else: # others find a block
-            if self.lead < 0:
+            if (N > 1 and float(self.diff_w) < -0.3) or (N <= 1 and self.lead < 0):
                 decision = -1
-            # elif self.lead == 0:
-            #     # publish one, it will trigger s1 with lead = 0 (line 437)
-            #     decision = 1
-            # elif self.lead == 1:
-            #     # publish all, it will trigger s1 with lead = 1 (line 432)
-            #     decision = 1
-
-            else: # self.lead >= 2
-                # publish one, it will trigger s1 with lead >= 2 (line 437)
+            else: 
                 decision = 1
-            # Longer re-orgs: Only feasible if pure PoW, no PoP (ie, k = 1, D=0 (effectively first-seen))
-            # elif self.lead < 2:
-            #     decision = 1
-            # else:
-            #     decision = 0
 
         if decision < 0:
             # Adopt if we have withheld OR our private head is out of sync with public
@@ -484,10 +518,7 @@ class SelfishMiner:
             item = self._pending_release.pop(0)
             if isinstance(item, Block):
                 # In WS-mode, uncles were skipped at mine time; fill them lazily at publish for metrics
-                try:
-                    N = int(self.work_shares) if isinstance(self.work_shares, int) else 1
-                except Exception:
-                    N = 1
+                N = self.work_shares
                 if N > 1 and not item.uncles:
                     pid = item.parent_id
                     uncles_pub: List[str] = []
@@ -600,10 +631,7 @@ class SelfishMiner:
             work_shares=getattr(src, 'work_shares', 1),
         )
         # Compute windowed subset of the DAG to clone
-        try:
-            wsN = int(getattr(src, 'work_shares', 1) or 1)
-        except Exception:
-            wsN = 1
+        wsN = src.work_shares
         if wsN <= 0:
             wsN = 1
         W = max(1, int(src.k) * int(wsN) * 10)
