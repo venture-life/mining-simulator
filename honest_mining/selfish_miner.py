@@ -396,57 +396,14 @@ class SelfishMiner:
         return parent
 
 
-    def get_lead(self, now: Optional[float] = None) -> int:
-        """
-        Return the height lead (private_head_height - public_head_height) and update diff_w.
-
-        Side effect
-        ----------
-        - Sets `self.diff_w` to the time-aware effective weight difference between the private
-          and public suffixes since their LCA at time `now` (or the last event time):
-            diff_w = sum_private_step_weights_that_are_still_in_time(now) - sum_public_step_weights
-          where private suffix steps are counted only if `public._is_in_time(height, now)` is True.
-
-        Parameters
-        ----------
-        now : Optional[float]
-            Evaluation time. If None, uses `self._now_time` maintained by events.
-        """
+    def get_lead(self) -> int:
+        """Return private_head_height - public_head_height."""
         pub_head = self.public.blocks[self.public.selected_head_id]
         prv_head = self.private.blocks[self.private.selected_head_id]
 
-        t_now = float(now if now is not None else getattr(self, "_now_time", 0.0))
-        # Build public path and locate LCA with the private head, then take suffixes.
-        pub_path = self.public._iter_path_from_head(pub_head.id)
-        pub_ids_set = set(b.id for b in pub_path)
-        prv_suffix_rev: List[str] = []
-        cur = prv_head
-        while cur is not None and cur.id not in pub_ids_set:
-            prv_suffix_rev.append(cur.id)
-            if cur.parent_id is None:
-                break
-            cur = self.private.blocks.get(cur.parent_id)
-        lca_id = cur.id if (cur is not None and cur.id in pub_ids_set) else (pub_path[0].id if pub_path else self.public.selected_head_id)
-        idx_map = {b.id: i for i, b in enumerate(pub_path)}
-        lca_idx = idx_map.get(lca_id, -1)
-        pub_suffix_ids = [b.id for b in pub_path[lca_idx + 1:]] if lca_idx >= 0 else [b.id for b in pub_path]
-        prv_suffix_ids = list(reversed(prv_suffix_rev))
+        self.diff_w = self.private.cum_block_weight.get(self.private.selected_head_id, 0) - self.public.cum_block_weight.get(self.public.selected_head_id, 0)
+        return int(prv_head.height) - int(pub_head.height)        
 
-        w_pub = 0.0
-        for bid in pub_suffix_ids:
-            w_pub += float(self.public.step_weight.get(bid, 0.0))
-
-        w_prv_eff = 0.0
-        for bid in prv_suffix_ids:
-            blk = self.private.blocks.get(bid)
-            if blk is None:
-                continue
-            h = int(getattr(blk, "height", 0) or 0)
-            # Count private step weight only if it would still be in-time at t_now.
-            if self.public._is_in_time(h, t_now):
-                w_prv_eff += float(self.private.step_weight.get(bid, 0.0))
-        self.diff_w = float(w_prv_eff - w_pub)
-        return int(prv_head.height) - int(pub_head.height)
 
 
     def act(self, now: float) -> Optional[Union[Block, WorkShare]]:
@@ -483,7 +440,7 @@ class SelfishMiner:
         # Default SM1 behaviour if no decider is provided
         # we found a block (s0), or get a callback when we recently broadcasted one (s1)
         elif self.last == "s0" or self.last == "s1":
-            if (N > 1 and self.last == "s1" and float(self.diff_w) == 1.0 / float(N)) or (N <= 1 and self.lead == 1 and self.last == "s1"):
+            if (N > 1 and float(self.diff_w) >= 1.0 / float(N)) or (N <= 1 and self.lead == 1 and self.last == "s1"):
                 if self._withheld:
                     decision = 1
                 else:
@@ -491,7 +448,7 @@ class SelfishMiner:
             else:
                 decision = 0
         else: # others find a block
-            if (N > 1 and float(self.diff_w) < -0.3) or (N <= 1 and self.lead < 0):
+            if (N > 1 and float(self.diff_w) < -0.10) or (N <= 1 and self.lead < 0):
                 decision = -1
             else: 
                 decision = 1
