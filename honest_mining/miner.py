@@ -151,33 +151,6 @@ class Miner:
         self.selected_head_id: str = genesis.id
 
     # ------------------------- public API -------------------------
-    def on_receive(self, block: Block, received_time: float) -> None:
-        """
-        Receive a block from the network at received_time.
-        Assumes ordered per-miner delivery: if parent_id is set, parent must already be known.
-        """
- 
-        # Fast path: duplicate delivery → keep earliest first-seen and return
-        if block.id in self.blocks:
-            return
- 
-        # Record earliest first-seen timestamp
-        prev_seen = self.block_first_seen.get(block.id)
-        if prev_seen is None or received_time < prev_seen:
-            self.block_first_seen[block.id] = received_time
- 
-        # Enforce parent-known invariant under ordered delivery
-        if block.parent_id is not None and block.parent_id not in self.blocks:
-            raise AssertionError("Out-of-order delivery: parent unknown for block {bid} (parent {pid})".format(
-                bid=block.id, pid=block.parent_id
-            ))
-
-        # Connect immediately
-        self._add_block_connected(block, received_time)
-
-        # Update selected head after processing this receive
-        self._update_selected_head()
-
     def on_mine(self, now: float):
         """
         Called when this miner wins the lottery at time `now`.
@@ -241,6 +214,33 @@ class Miner:
             ws = WorkShare(id=ws_id, parent_id=pid, miner_id=self.miner_id, version=cur, created_time=now)
             return ws
 
+    def on_receive(self, block: Block, received_time: float) -> None:
+        """
+        Receive a block from the network at received_time.
+        Assumes ordered per-miner delivery: if parent_id is set, parent must already be known.
+        """
+ 
+        # Fast path: duplicate delivery → keep earliest first-seen and return
+        if block.id in self.blocks:
+            return
+ 
+        # Record earliest first-seen timestamp
+        prev_seen = self.block_first_seen.get(block.id)
+        if prev_seen is None or received_time < prev_seen:
+            self.block_first_seen[block.id] = received_time
+ 
+        # Enforce parent-known invariant under ordered delivery
+        if block.parent_id is not None and block.parent_id not in self.blocks:
+            raise AssertionError("Out-of-order delivery: parent unknown for block {bid} (parent {pid})".format(
+                bid=block.id, pid=block.parent_id
+            ))
+
+        # Connect immediately
+        self._add_block_connected(block, received_time)
+        # Update selected head after processing this receive
+        self._update_selected_head()
+
+
     def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
         """
         Receive a work-share and update per-parent counts. Duplicate deliveries are ignored.
@@ -271,6 +271,7 @@ class Miner:
             changed = self._apply_late_ws_to_children(ws, received_time)
             if changed:
                 self._update_selected_head()
+
 
     # ------------------------- internal helpers -------------------------
     def _add_block_connected(self, block: Block, received_time: float) -> None:
@@ -354,45 +355,6 @@ class Miner:
         self.cum_block_weight[block.id] = parent_w + float(self.step_weight.get(block.id, 0.0))
 
     # ------------------------- helper methods -------------------------
-    def _is_in_time(self, new_height: int, at_time: float) -> bool:
-        """Return True if a prospective block at height new_height would be in-time at at_time."""
-        t0 = self.first_seen_time_by_height.get(int(new_height))
-        return (t0 is None) or ((float(at_time) - float(t0)) <= self.tau)
-
-    def _continuous_ws_for_parent(self, parent_id: str, cutoff_time: Optional[float]) -> Tuple[int, List[str]]:
-        """Return (count, ids) of earliest-per-version WS for parent_id up to cutoff_time, continuous from v=0.
-
-        Note: We maintain earliest-per-version incrementally at delivery time; thus, all cached
-        entries reflect WS whose arrival time <= now. For callers passing `cutoff_time`=now, this
-        is equivalent to filtering by time.
-        """
-        emap = self._ws_earliest_id_by_parent.get(parent_id, {})
-        cc = int(self._ws_contig_count_by_parent.get(parent_id, 0))
-        ids: List[str] = []
-        for v in range(cc):
-            wsid = emap.get(v)
-            if wsid is None:
-                break
-            # If a historical cutoff_time earlier than arrival is requested, skip (rare case)
-            if (cutoff_time is not None):
-                t_ws = self._ws_arrival_time_by_id.get(wsid)
-                if t_ws is None or float(t_ws) > float(cutoff_time):
-                    break
-            ids.append(wsid)
-        return (len(ids), ids)
-
-    def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
-        """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode."""
-        N = self.work_shares
-        if N <= 1:
-            return 1.0
-        h_new = int(cand.height) + 1
-        if not self._is_in_time(h_new, at_time):
-            return 0.0
-        cnt, _ = self._continuous_ws_for_parent(cand.id, at_time)
-        base = 1.0 / float(N)
-        return float(base + base * float(cnt))
-
     def choose_parent_to_mine_upon(self, now: float, for_workshare: bool = False) -> Block:
         """WS-aware parent selection between current head and its parent.
 
@@ -429,6 +391,46 @@ class Miner:
                 parent = best_cands[0]
         return parent
 
+    def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
+        """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode."""
+        N = self.work_shares
+        if N <= 1:
+            return 1.0
+        h_new = int(cand.height) + 1
+        if not self._is_in_time(h_new, at_time):
+            return 0.0
+        cnt, _ = self._continuous_ws_for_parent(cand.id, at_time)
+        base = 1.0 / float(N)
+        return float(base + base * float(cnt))
+
+    def _is_in_time(self, new_height: int, at_time: float) -> bool:
+        """Return True if a prospective block at height new_height would be in-time at at_time."""
+        t0 = self.first_seen_time_by_height.get(int(new_height))
+        return (t0 is None) or ((float(at_time) - float(t0)) <= self.tau)
+
+    def _continuous_ws_for_parent(self, parent_id: str, cutoff_time: Optional[float]) -> Tuple[int, List[str]]:
+        """Return (count, ids) of earliest-per-version WS for parent_id up to cutoff_time, continuous from v=0.
+
+        Note: We maintain earliest-per-version incrementally at delivery time; thus, all cached
+        entries reflect WS whose arrival time <= now. For callers passing `cutoff_time`=now, this
+        is equivalent to filtering by time.
+        """
+        emap = self._ws_earliest_id_by_parent.get(parent_id, {})
+        cc = int(self._ws_contig_count_by_parent.get(parent_id, 0))
+        ids: List[str] = []
+        for v in range(cc):
+            wsid = emap.get(v)
+            if wsid is None:
+                break
+            # If a historical cutoff_time earlier than arrival is requested, skip (rare case)
+            if (cutoff_time is not None):
+                t_ws = self._ws_arrival_time_by_id.get(wsid)
+                if t_ws is None or float(t_ws) > float(cutoff_time):
+                    break
+            ids.append(wsid)
+        return (len(ids), ids)
+
+    # Helper for _add_block_connected
     def _initial_step_weight_for_block(self, block: Block, t_recv: float) -> float:
         """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set."""
         N = self.work_shares
@@ -448,6 +450,7 @@ class Miner:
                     counted.add(ws_id)
         return float(step_w)
 
+    # Helper for on_receive_workshare
     def _apply_late_ws_to_children(self, ws: WorkShare, received_time: float) -> bool:
         """Apply late WS within tau to eligible child blocks; returns True if any weights changed."""
         pid = ws.parent_id or "GENESIS"

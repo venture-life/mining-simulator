@@ -143,55 +143,6 @@ class SelfishMiner:
 
 
     # ------------------------- public API (mirror) -------------------------
-    def on_receive(self, block: Block, received_time: float) -> None:
-        """
-        Receive a block from the network at `received_time` and update the PUBLIC view.
-
-        Notes
-        -----
-        - Callers are expected to provide a fresh `Block` (the simulator already does) so it can
-          be passed straight into the honest `Miner` without mutating shared state.
-        - The private view remains unchanged here; withheld blocks stay isolated until
-          `_adopt_public()` is triggered.
-        """
-
-        # Fast path: duplicate delivery → keep earliest first-seen and return
-        if block.id in self.public.blocks:
-            return
-
-        self.public.on_receive(block, received_time)
-        self._now_time = float(received_time)
-        
-        self._last_event = "receive"
-        self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
-        if self._last_receive_from_competitor:
-            # only log lead if it was a new block, ie. not one we published ourselfs... that would be doublecounting lead, since it's already in on_mine
-            self.lead = self.get_lead()
-            if self.public.blocks[block.parent_id].miner_id == self.miner_id:
-                # extends us
-                self.last = 'h1'
-            else:
-                # extends rando
-                self.last = 'h0'
-        else:
-            self.last = 's1'
-        # Increment local event counter (idempotence key)
-        self._local_event_id += 1
-
-
-    def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
-        """Forward work-share deliveries to the PUBLIC view for bookkeeping.
-
-        Selfish miners ignore work-shares for strategy but keep counts per parent for
-        versioning semantics when interoperability is needed.
-        """
-        self.public.on_receive_workshare(ws, received_time)
-        self._now_time = float(received_time)
-        # If PRIVATE aliases PUBLIC, the PUBLIC update already applied; avoid double-processing
-        if (not self._private_alias) and (ws.parent_id in self.private.blocks):
-            self.private.on_receive_workshare(ws, received_time)
-        
-
 
     def on_mine(self, now: float):
         """
@@ -312,12 +263,61 @@ class SelfishMiner:
             self._local_event_id += 1
             return None
 
+    def on_receive(self, block: Block, received_time: float) -> None:
+        """
+        Receive a block from the network at `received_time` and update the PUBLIC view.
 
+        Notes
+        -----
+        - Callers are expected to provide a fresh `Block` (the simulator already does) so it can
+          be passed straight into the honest `Miner` without mutating shared state.
+        - The private view remains unchanged here; withheld blocks stay isolated until
+          `_adopt_public()` is triggered.
+        """
+
+        # Fast path: duplicate delivery → keep earliest first-seen and return
+        if block.id in self.public.blocks:
+            return
+
+        self.public.on_receive(block, received_time)
+        self._now_time = float(received_time)
+        
+        self._last_event = "receive"
+        self._last_receive_from_competitor = bool(block.miner_id is not None and block.miner_id != self.miner_id)
+        if self._last_receive_from_competitor:
+            self.lead = self.get_lead()
+            if self.public.blocks[block.parent_id].miner_id == self.miner_id:
+                # extends us
+                self.last = 'h1'
+            else:
+                # extends rando
+                self.last = 'h0'
+        else:
+            self.last = 's1'
+        # Increment local event counter (idempotence key)
+        self._local_event_id += 1
+
+
+    def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
+        """Forward work-share deliveries to the PUBLIC view for bookkeeping.
+
+        Selfish miners ignore work-shares for strategy but keep counts per parent for
+        versioning semantics when interoperability is needed.
+        """
+        self.public.on_receive_workshare(ws, received_time)
+        self._now_time = float(received_time)
+        # If PRIVATE aliases PUBLIC, the PUBLIC update already applied; avoid double-processing
+        # If we are withholding a block, we don't benefit from consuming a public workshare
+        if (not self._private_alias) and (not self._withheld):
+            self.private.on_receive_workshare(ws, received_time)
+
+
+    # ------------------------- helper methods -------------------------
     def choose_parent_to_mine_upon(self, now: float, for_workshare: bool = False) -> Block:
         # Choose parent:
         # - Default: use the PRIVATE view's head per fork rules.
         # - Special case (Rule 3 tie and non-deterministic selection):
-        #     prefer a head mined by us; else prefer a head whose parent was mined by us; else uniform random.         
+        #     prefer a head mined by us; else prefer a head whose parent was mined by us; else uniform random.
         parent = None
         if not self.deterministic_selection:
             try:
