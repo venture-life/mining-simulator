@@ -654,8 +654,6 @@ class SelfishMiner:
         try:
             dst.workshare_count_by_parent = {pid: v for pid, v in getattr(src, 'workshare_count_by_parent', {}).items() if pid in R}
             dst._seen_workshare_ids = set()  # safe to reset in PRIVATE; duplicates won't replay there
-            dst._ws_arrivals_by_parent = {pid: list(v) for pid, v in getattr(src, '_ws_arrivals_by_parent', {}).items() if pid in R}
-            dst._ws_counted_by_block = {bid: set(v) for bid, v in getattr(src, '_ws_counted_by_block', {}).items() if bid in S}
             # WS continuity caches
             dst._ws_earliest_id_by_parent = {pid: dict(v) for pid, v in getattr(src, '_ws_earliest_id_by_parent', {}).items() if pid in R}
             dst._ws_contig_count_by_parent = {pid: v for pid, v in getattr(src, '_ws_contig_count_by_parent', {}).items() if pid in R}

@@ -130,10 +130,8 @@ class Miner:
         # - _seen_workshare_ids: de-dup set by work-share id to ignore exact duplicates.
         self.workshare_count_by_parent: Dict[str, int] = {}
         self._seen_workshare_ids: Set[str] = set()
-        # WS arrival tuples by parent: (arrival_time, ws_id, version)
-        # Used to build included_ws_ids at mine-time and to evaluate pre-block/late WS inclusion
-        self._ws_arrivals_by_parent: Dict[str, List[Tuple[float, str, int]]] = {}
-        self._ws_counted_by_block: Dict[str, Set[str]] = {}
+        # WS arrival time index (by ws_id) used for strict pre-block cutoff checks when crediting
+        # (a WS contributes to a block only if t_ws < t_block - tau). No retroactive credit.
         # WS continuity caches to avoid repeated scans/sorts
         # - _ws_earliest_id_by_parent[pid][ver] = first-seen ws_id for that version
         # - _ws_contig_count_by_parent[pid] = largest m such that versions [0..m-1] are all present
@@ -149,6 +147,8 @@ class Miner:
         self._add_block_connected(genesis, received_time=0.0)
         # Selected head tracking (updated on every event thereafter)
         self.selected_head_id: str = genesis.id
+        # Lazy head recompute flag: when True, head may be stale and should be recomputed on demand
+        self._head_dirty: bool = False
 
     # ------------------------- public API -------------------------
     def on_mine(self, now: float):
@@ -237,8 +237,8 @@ class Miner:
 
         # Connect immediately
         self._add_block_connected(block, received_time)
-        # Update selected head after processing this receive
-        self._update_selected_head()
+        # Mark head as dirty; defer recomputation until needed
+        self._head_dirty = True
 
 
     def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
@@ -254,23 +254,18 @@ class Miner:
         cur_next = self.workshare_count_by_parent.get(pid, 0)
         v = int(getattr(ws, "version", 0) or 0)
         self.workshare_count_by_parent[pid] = max(cur_next, v + 1)
-        # Record arrival for future blocks referencing this parent
-        self._ws_arrivals_by_parent.setdefault(pid, []).append((received_time, ws.id, v))
-        self._ws_arrival_time_by_id[ws.id] = float(received_time)
-        # Update earliest-per-version cache and contiguous count for this parent
+        # Update earliest-per-version cache and contiguous count for this parent.
+        # We store arrival time ONLY for the earliest-per-version id to avoid double-counting
+        # duplicate workshares at the same version in later block credit.
         emap = self._ws_earliest_id_by_parent.setdefault(pid, {})
         if v not in emap:
             emap[v] = ws.id
+            self._ws_arrival_time_by_id[ws.id] = float(received_time)
         # Increment contiguous count while next version exists
         cur_cc = int(self._ws_contig_count_by_parent.get(pid, 0))
         while emap.get(cur_cc) is not None:
             cur_cc += 1
         self._ws_contig_count_by_parent[pid] = cur_cc
-        # If WS-based weighting is enabled (N>1), apply late WS within tau to eligible child blocks
-        if self.work_shares and int(self.work_shares) > 1:
-            changed = self._apply_late_ws_to_children(ws, received_time)
-            if changed:
-                self._update_selected_head()
 
 
     # ------------------------- internal helpers -------------------------
@@ -324,19 +319,15 @@ class Miner:
         # Use the earliest known first-seen time for this block (fallback to provided)
         t_recv = self.block_first_seen.get(block.id, received_time)
 
-        # In-time classification based on earliest first-seen at this height (t0)
-        t0 = self.first_seen_time_by_height.get(h)
-        if t0 is None:
-            # First block seen at this height establishes t0 and is in-time
+        # Establish t0 for this height if absent, then classify using helper
+        if self.first_seen_time_by_height.get(h) is None:
+            # First block seen at this height establishes t0
             self.first_seen_time_by_height[h] = t_recv
+        if self._is_in_time(int(h), float(t_recv)):
             self.in_time_blocks.add(block.id)
         else:
-            # Classify this block against existing t0
-            if (t_recv - t0) <= self.tau:
-                self.in_time_blocks.add(block.id)
-            else:
-                # Ensure it's not incorrectly marked in-time
-                self.in_time_blocks.discard(block.id)
+            # Ensure it's not incorrectly marked in-time
+            self.in_time_blocks.discard(block.id)
 
         # Compute and store step weight and cumulative weight
         if self.work_shares and int(self.work_shares) > 1:
@@ -359,11 +350,12 @@ class Miner:
         """WS-aware parent selection between current head and its parent.
 
         - Maximizes immediate prospective cumulative weight if we mine on the candidate now.
+        - Prospective BLOCK step counts only WS older than (now - tau).
         - When for_workshare=True and N>1, adds a marginal +base if the new WS would extend
           the contiguous prefix for that parent at time now.
         - On ties, prefers the current head to avoid self-forks.
         """
-        parent = self._select_head()
+        parent = self._get_head()
         N = self.work_shares
         if N > 1 and parent is not None:
             candidates: List[Block] = [parent]
@@ -392,14 +384,17 @@ class Miner:
         return parent
 
     def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
-        """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode."""
+        """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode.
+
+        Counts only work-shares with arrival strictly earlier than (at_time - tau).
+        """
         N = self.work_shares
         if N <= 1:
             return 1.0
         h_new = int(cand.height) + 1
         if not self._is_in_time(h_new, at_time):
             return 0.0
-        cnt, _ = self._continuous_ws_for_parent(cand.id, at_time)
+        cnt, _ = self._continuous_ws_for_parent(cand.id, float(at_time) - float(self.tau))
         base = 1.0 / float(N)
         return float(base + base * float(cnt))
 
@@ -432,64 +427,32 @@ class Miner:
 
     # Helper for _add_block_connected
     def _initial_step_weight_for_block(self, block: Block, t_recv: float) -> float:
-        """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set."""
+        """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set.
+
+        A WS contributes to this block only if t_ws < (t_recv - tau). No retroactive credit is applied.
+        """
         N = self.work_shares
         base = 1.0 / float(N)
         if block.id not in self.in_time_blocks:
             return 0.0
         step_w = base
-        pid = block.parent_id or "GENESIS"
         included: Set[str] = set(getattr(block, "included_ws_ids", []) or [])
         if included:
-            counted = self._ws_counted_by_block.setdefault(block.id, set())
-            # Count only included WS that arrived before this block
+            # Count only included WS that arrived strictly before (t_recv - tau)
             for ws_id in list(included):
                 t_ws = self._ws_arrival_time_by_id.get(ws_id)
-                if (t_ws is not None) and (float(t_ws) <= float(t_recv)) and (ws_id not in counted):
+                if (t_ws is not None) and (float(t_ws) < (float(t_recv) - float(self.tau))):
                     step_w += base
-                    counted.add(ws_id)
         return float(step_w)
 
-    # Helper for on_receive_workshare
-    def _apply_late_ws_to_children(self, ws: WorkShare, received_time: float) -> bool:
-        """Apply late WS within tau to eligible child blocks; returns True if any weights changed."""
-        pid = ws.parent_id or "GENESIS"
-        N = self.work_shares
-        base = 1.0 / float(N)
-        changed = False
-        for bid in list(self.children.get(pid, [])):
-            if bid not in self.blocks:
-                continue
-            t_block = self.block_first_seen.get(bid)
-            if t_block is None:
-                continue
-            blk_obj = self.blocks.get(bid)
-            if blk_obj is None:
-                continue
-            if (received_time >= t_block) and (received_time <= t_block + self.tau) and (bid in self.in_time_blocks) and (ws.id in getattr(blk_obj, "included_ws_ids", [])):
-                counted = self._ws_counted_by_block.setdefault(bid, set())
-                if (ws.id not in counted):
-                    counted.add(ws.id)
-                    self.step_weight[bid] = float(self.step_weight.get(bid, 0.0)) + base
-                    self._propagate_weight_delta_from(bid, base)
-                    changed = True
-        return changed
-
-    def _propagate_weight_delta_from(self, bid: str, delta: float) -> None:
-        """Propagate a step-weight increment delta from block bid to all its descendants."""
-        if not delta:
-            return
-        # Update this block and all descendants cumulatively
-        stack = [bid]
-        while stack:
-            x = stack.pop()
-            self.cum_block_weight[x] = float(self.cum_block_weight.get(x, 0.0)) + delta
-            stack.extend(self.children.get(x, []))
+    # Retroactive WS credit and descendant weight propagation are disabled under strict SoP.
+    # No late workshare can change an already-received block's weight.
 
     def _update_selected_head(self) -> None:
         """Refresh the cached selected mining head according to current fork-resolution rules."""
         head = self._select_head()
         self.selected_head_id = head.id
+        self._head_dirty = False
 
 
     def _select_head(self) -> Block:
@@ -535,6 +498,12 @@ class Miner:
             return self.blocks[chosen_id]
         else:
             return self._rng.choice(best)
+
+    def _get_head(self) -> Block:
+        """Return the current head, recomputing if marked dirty."""
+        if self._head_dirty or not hasattr(self, "selected_head_id"):
+            self._update_selected_head()
+        return self.blocks[self.selected_head_id]
 
     def _current_heads(self) -> List[Block]:
         max_h = self.max_height
