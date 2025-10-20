@@ -15,8 +15,9 @@ class Block:
     -----
     - Height is derived from parent (genesis height = 0).
     - Cumulative chain weight is miner-local and stored in Miner.cum_block_weight,
-      not on the Block itself. Step weight = 1 if this block is in-time + number
-      of in-time uncles it references at creation time; 0 if the block is late.
+      not on the Block itself.
+      Legacy (N<=1): step weight = 1 if in-time + number of in-time uncles, else 0.
+      WS-mode (N>1): step weight = base + base×(# credited WS), uncles ignored; 0 if late.
     - Uncles are references to block ids that are siblings of this block's parent
       ("N-1" relative to this block): siblings of parent at parent's height that
       were in-time from the miner's perspective at creation time.
@@ -135,10 +136,14 @@ class Miner:
         # WS continuity caches to avoid repeated scans/sorts
         # - _ws_earliest_id_by_parent[pid][ver] = first-seen ws_id for that version
         # - _ws_contig_count_by_parent[pid] = largest m such that versions [0..m-1] are all present
-        # - _ws_arrival_time_by_id[ws_id] = local delivery time for fast cutoff checks
+        # - _ws_arrival_time_by_id[ws_id] = local delivery time for cutoff checks (no retro credit)
+        # - _ws_parent_by_id[ws_id] = parent id of the work-share (parent invariant)
+        # - _ws_version_by_id[ws_id] = version index of the work-share (one WS per version credited)
         self._ws_earliest_id_by_parent: Dict[str, Dict[int, str]] = {}
         self._ws_contig_count_by_parent: Dict[str, int] = {}
         self._ws_arrival_time_by_id: Dict[str, float] = {}
+        self._ws_parent_by_id: Dict[str, str] = {}
+        self._ws_version_by_id: Dict[str, int] = {}
 
         # Genesis
         genesis = Block(id=genesis_id, parent_id=None, miner_id=None, height=0, uncles=[], created_time=0.0)
@@ -244,15 +249,21 @@ class Miner:
     def on_receive_workshare(self, ws: WorkShare, received_time: float) -> None:
         """
         Receive a work-share and update per-parent counts. Duplicate deliveries are ignored.
+
+        Also records parent, version, and arrival time for all work-shares to enforce
+        parent invariant, time gating, and one-WS-per-version crediting.
         """
         if ws.id in self._seen_workshare_ids:
             return
         self._seen_workshare_ids.add(ws.id)
         pid = ws.parent_id or "GENESIS"
+        self._ws_parent_by_id[ws.id] = pid
+        self._ws_arrival_time_by_id[ws.id] = float(received_time)
         # Update next-version index as max(current, ws.version + 1) to avoid over-counting
         # when multiple distinct work-shares exist at the same version for this parent.
         cur_next = self.workshare_count_by_parent.get(pid, 0)
         v = int(getattr(ws, "version", 0) or 0)
+        self._ws_version_by_id[ws.id] = v
         self.workshare_count_by_parent[pid] = max(cur_next, v + 1)
         # Update earliest-per-version cache and contiguous count for this parent.
         # We store arrival time ONLY for the earliest-per-version id to avoid double-counting
@@ -260,7 +271,6 @@ class Miner:
         emap = self._ws_earliest_id_by_parent.setdefault(pid, {})
         if v not in emap:
             emap[v] = ws.id
-            self._ws_arrival_time_by_id[ws.id] = float(received_time)
         # Increment contiguous count while next version exists
         cur_cc = int(self._ws_contig_count_by_parent.get(pid, 0))
         while emap.get(cur_cc) is not None:
@@ -363,6 +373,7 @@ class Miner:
                 par = self.blocks.get(parent.parent_id)
                 if par is not None:
                     candidates.append(par)
+                    # pass
             best_val = None
             best_cands: List[Block] = []
             base = 1.0 / float(N)
@@ -381,12 +392,16 @@ class Miner:
                     best_cands.append(cand)
             if best_cands:
                 parent = best_cands[0]
+                # parent = random.choice(best_cands)
         return parent
 
     def _prospective_step_if_mined_on(self, cand: Block, at_time: float) -> float:
         """Compute the immediate step weight for a new child mined on cand at at_time under WS-mode.
 
-        Counts only work-shares with arrival strictly earlier than (at_time - tau).
+        Estimates credit as base + base×cnt where cnt is the size of the earliest-per-version
+        contiguous prefix with earliest arrival < (at_time - tau). This mirrors on_mine()'s
+        default inclusion policy. Actual crediting at receipt uses the per-WS rules in
+        _initial_step_weight_for_block().
         """
         N = self.work_shares
         if N <= 1:
@@ -403,7 +418,7 @@ class Miner:
         t0 = self.first_seen_time_by_height.get(int(new_height))
         return (t0 is None) or ((float(at_time) - float(t0)) <= self.tau)
 
-    def _continuous_ws_for_parent(self, parent_id: str, cutoff_time: Optional[float]) -> Tuple[int, List[str]]:
+    def _continuous_ws_for_parent(self, parent_id: str, cutoff_time: float) -> Tuple[int, List[str]]:
         """Return (count, ids) of earliest-per-version WS for parent_id up to cutoff_time, continuous from v=0.
 
         Note: We maintain earliest-per-version incrementally at delivery time; thus, all cached
@@ -417,11 +432,9 @@ class Miner:
             wsid = emap.get(v)
             if wsid is None:
                 break
-            # If a historical cutoff_time earlier than arrival is requested, skip (rare case)
-            if (cutoff_time is not None):
-                t_ws = self._ws_arrival_time_by_id.get(wsid)
-                if t_ws is None or float(t_ws) > float(cutoff_time):
-                    break
+            t_ws = self._ws_arrival_time_by_id.get(wsid)
+            if t_ws is None or float(t_ws) >= float(cutoff_time):
+                break
             ids.append(wsid)
         return (len(ids), ids)
 
@@ -429,7 +442,12 @@ class Miner:
     def _initial_step_weight_for_block(self, block: Block, t_recv: float) -> float:
         """Compute WS-mode initial step weight for a just-received block at t_recv and update counted set.
 
-        A WS contributes to this block only if t_ws < (t_recv - tau). No retroactive credit is applied.
+        A WS is credited only if:
+        - it references the same parent as the block (parent invariant), and
+        - t_ws < (t_recv - tau) (strict pre-cutoff), and
+        - its version is within the block's pre-cutoff contiguous prefix among the included WS, and
+        - at most one WS per version is counted.
+        No retroactive credit is applied.
         """
         N = self.work_shares
         base = 1.0 / float(N)
@@ -438,15 +456,28 @@ class Miner:
         step_w = base
         included: Set[str] = set(getattr(block, "included_ws_ids", []) or [])
         if included:
-            # Count only included WS that arrived strictly before (t_recv - tau)
-            for ws_id in list(included):
+            parent_id = block.parent_id
+            cutoff = float(t_recv) - float(self.tau)
+            # Build eligible versions from the block's included WS (same parent, pre-cutoff).
+            eligible_versions: Set[int] = set()
+            for ws_id in included:
+                if self._ws_parent_by_id.get(ws_id) != parent_id:
+                    continue
                 t_ws = self._ws_arrival_time_by_id.get(ws_id)
-                if (t_ws is not None) and (float(t_ws) < (float(t_recv) - float(self.tau))):
-                    step_w += base
+                if (t_ws is None) or (float(t_ws) >= cutoff):
+                    continue
+                ver = self._ws_version_by_id.get(ws_id)
+                if ver is None:
+                    continue
+                eligible_versions.add(int(ver))
+            # Enforce contiguity based on the actual included WS set: credit only the
+            # contiguous prefix of versions starting at 0 that are present pre-cutoff.
+            contig = 0
+            while contig in eligible_versions:
+                contig += 1
+            step_w += base * float(contig)
         return float(step_w)
 
-    # Retroactive WS credit and descendant weight propagation are disabled under strict SoP.
-    # No late workshare can change an already-received block's weight.
 
     def _update_selected_head(self) -> None:
         """Refresh the cached selected mining head according to current fork-resolution rules."""
